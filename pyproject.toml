@@ -1,0 +1,22 @@
+[project]
+name = "uc-storage-migration"
+version = "0.1.0"
+description = "Discovery and migration tooling for Unity Catalog storage reconciliation"
+requires-python = ">=3.11"
+dependencies = [
+    "databricks-sdk>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
+
+[tool.setuptools.packages.find]
+include = ["utils*"]
