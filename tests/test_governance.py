@@ -115,3 +115,97 @@ def test_governance_snapshot_dataclass_holds_everything():
     assert snap.owner == "alice"
     assert len(snap.column_masks) == 1
     assert snap.column_masks[0].column == "ssn"
+
+
+from unittest.mock import MagicMock
+
+from utils.governance import GovernanceCapturer, GovernanceReplayer
+
+
+class _Row(dict):
+    def asDict(self):
+        return dict(self)
+
+
+def _spark_returning(*calls):
+    """Return a spark mock where consecutive .sql(...).collect() calls yield each call's rows."""
+    spark = MagicMock()
+    results = []
+    for call in calls:
+        r = MagicMock()
+        r.collect.return_value = call
+        results.append(r)
+    spark.sql.side_effect = results
+    return spark
+
+
+class TestGovernanceCapturer:
+    def test_capture_assembles_snapshot(self):
+        spark = _spark_returning(
+            [_Row(principal="u1", action_type="SELECT", object_type="TABLE", object_key="c.s.t")],
+            [_Row(col_name="Owner", data_type="alice")],
+            [_Row(tag_name="pii", tag_value="true")],
+            [],
+            [],
+            [_Row(col_name="id", data_type="bigint", comment="primary key")],
+            [_Row(key="delta.columnMapping.mode", value="name")],
+        )
+        cap = GovernanceCapturer(spark=spark)
+
+        snap = cap.capture(catalog="c", schema="s", name="t")
+
+        assert snap.grants == [GrantEntry("u1", "SELECT", "TABLE")]
+        assert snap.owner == "alice"
+        assert snap.tags == [TagEntry("pii", "true")]
+        assert snap.column_comments == {"id": "primary key"}
+        assert snap.table_properties == {"delta.columnMapping.mode": "name"}
+
+
+class TestGovernanceReplayer:
+    def test_replay_emits_grant_owner_tag_comment(self):
+        spark = MagicMock()
+        rep = GovernanceReplayer(spark=spark)
+        snap = GovernanceSnapshot(
+            catalog="c", schema="s", name="t",
+            grants=[GrantEntry("u1", "SELECT", "TABLE")],
+            owner="alice",
+            tags=[TagEntry("pii", "true")],
+            row_filter_name=None, row_filter_using_columns=[],
+            column_masks=[],
+            table_comment="hello",
+            column_comments={},
+            table_properties={},
+        )
+
+        warnings = rep.replay(snap, target_fqn=("c", "s", "t"))
+
+        executed = [call.args[0] for call in spark.sql.call_args_list]
+        assert "GRANT SELECT ON TABLE `c`.`s`.`t` TO `u1`" in executed
+        assert "ALTER TABLE `c`.`s`.`t` OWNER TO `alice`" in executed
+        assert any("SET TAGS" in s for s in executed)
+        assert any("COMMENT ON TABLE" in s for s in executed)
+        assert warnings == []
+
+    def test_replay_warns_on_row_filter(self):
+        spark = MagicMock()
+        snap = GovernanceSnapshot(
+            catalog="c", schema="s", name="t",
+            grants=[], owner=None, tags=[],
+            row_filter_name="filter_x", row_filter_using_columns=["col1"],
+            column_masks=[],
+            table_comment=None, column_comments={}, table_properties={},
+        )
+        warnings = GovernanceReplayer(spark=spark).replay(snap, target_fqn=("c", "s", "t"))
+        assert any("row filter 'filter_x'" in w for w in warnings)
+
+    def test_replay_collects_grant_failure(self):
+        spark = MagicMock()
+        spark.sql.side_effect = Exception("principal not found")
+        snap = GovernanceSnapshot(
+            catalog="c", schema="s", name="t",
+            grants=[GrantEntry("u_deleted", "SELECT", "TABLE")],
+            owner=None, tags=[], row_filter_name=None, row_filter_using_columns=[],
+            column_masks=[], table_comment=None, column_comments={}, table_properties={},
+        )
+        warnings = GovernanceReplayer(spark=spark).replay(snap, target_fqn=("c", "s", "t"))
+        assert any("grant replay failed" in w for w in warnings)
