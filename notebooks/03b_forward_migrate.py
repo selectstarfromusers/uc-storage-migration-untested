@@ -75,7 +75,7 @@ from utils.migration import (
     derive_pre_migration_fqn, derive_staging_fqn,
 )
 from utils.preflight import (
-    check_external_location_for, probe_path_exists,
+    check_external_location_for, probe_path_exists, probe_partition_completeness,
 )
 from utils.sql import quote_fqn
 from utils.state import MigrationLog, SnapshotWriter
@@ -117,12 +117,23 @@ if target_new_path:
     print(f"External location for new account: {el.name} ({el.credential_name})")
 
 missing = []
+partition_warnings = []
 for r in drift + external_old:
     if not r["storage_path"]:
         continue
-    new_p = r["storage_path"].replace(f"@{OLD_STORAGE_ACCOUNT}.", f"@{NEW_STORAGE_ACCOUNT}.", 1)
+    old_p = r["storage_path"]
+    new_p = old_p.replace(f"@{OLD_STORAGE_ACCOUNT}.", f"@{NEW_STORAGE_ACCOUNT}.", 1)
     if not probe_path_exists(fs=fs, path=new_p):
         missing.append((r["catalog"], r["schema"], r["name"], new_p))
+        continue
+    # Partition completeness: compare directory counts at old vs new for
+    # tables/volumes that may be partitioned. probe_partition_completeness
+    # treats new >= old (with old > 0) as complete; flags shortfalls.
+    probe = probe_partition_completeness(fs=fs, old_path=old_p, new_path=new_p)
+    if not probe.complete and probe.old_count > 0:
+        partition_warnings.append(
+            (r["catalog"], r["schema"], r["name"], probe.old_count, probe.new_count)
+        )
 
 if missing:
     print(f"\n{len(missing)} object(s) missing at new path:")
@@ -130,6 +141,16 @@ if missing:
         print(f"  {c}.{s}.{n} -> {p}")
     if not DRY_RUN:
         raise RuntimeError("Pre-flight failed: complete the data copy before retrying.")
+
+if partition_warnings:
+    print(f"\n{len(partition_warnings)} object(s) with partition shortfall at new path:")
+    for c, s, n, old_cnt, new_cnt in partition_warnings[:20]:
+        print(f"  {c}.{s}.{n}: {new_cnt} entries at new vs {old_cnt} at old")
+    if not DRY_RUN:
+        raise RuntimeError(
+            "Pre-flight failed: one or more objects have fewer entries at new than "
+            "old. Finish the partitioned data copy before retrying."
+        )
 
 # COMMAND ----------
 # MAGIC %md
@@ -176,13 +197,26 @@ def _serialize_snapshot(snap) -> str:
 # MAGIC ## Step 3 — Migrate external tables (cheap: DROP + CREATE EXTERNAL TABLE)
 
 # COMMAND ----------
+# Map plan-builder action names to the spec's status vocabulary
+# (claimed → snapshot_taken → cloned → swapped → replayed → validated → failed).
+_ACTION_TO_STATUS = {
+    "clone": "cloned",
+    "ctas": "cloned",
+    "drop": "cloned",          # for external DROP+CREATE, drop is the first half
+    "create": "cloned",        # full clone-equivalent completes on create
+    "rename_orig": "cloned",   # intermediate step within swap; not a terminal state
+    "rename_staging": "swapped",
+}
+
+
 def _execute_steps(rec: ObjectRecord, steps: list[tuple[str, str]]) -> None:
     for action, sql in steps:
         if DRY_RUN:
             print(f"    DRY [{action}]: {sql}")
         else:
             spark.sql(sql)
-            mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name, status=action)
+            status = _ACTION_TO_STATUS.get(action, action)
+            mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name, status=status)
 
 
 for r in external_old:
@@ -328,6 +362,29 @@ for r in [x for x in drift if x["object_type"] == "TABLE" and x["data_source_for
         mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name,
                        status="failed", error_trace=traceback.format_exc())
         print(f"  FAILED managed non-Delta {rec.catalog}.{rec.schema}.{rec.name}: {e}")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Step 6.5 — Managed volumes (deferred to Plan 2.1)
+# MAGIC
+# MAGIC Managed volumes on old storage require: (1) physical data copy via
+# MAGIC `dbutils.fs.cp` from old to new managed path, (2) DROP + CREATE MANAGED
+# MAGIC VOLUME, (3) governance replay. Spec §9.3 item 5. This is Plan 2.1 scope —
+# MAGIC surfaced here so they are not silently missed.
+
+# COMMAND ----------
+managed_volumes = [r for r in drift if r["object_type"] == "VOLUME" and r["table_type"] == "MANAGED"]
+if managed_volumes:
+    print(f"{len(managed_volumes)} managed volume(s) on old storage — deferred:")
+    for r in managed_volumes:
+        print(f"  {r['catalog']}.{r['schema']}.{r['name']}")
+    print("\nThese need manual handling:")
+    print("  1. dbutils.fs.cp(old_path, new_path, recurse=True)")
+    print("  2. DROP VOLUME <fqn>")
+    print("  3. CREATE MANAGED VOLUME <fqn>")
+    print("  4. Replay grants via utils.governance.GovernanceReplayer")
+else:
+    print("No managed volumes on old storage.")
 
 # COMMAND ----------
 # MAGIC %md

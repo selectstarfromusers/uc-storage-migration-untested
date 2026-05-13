@@ -57,9 +57,9 @@ def build_show_tags_sql(*, catalog: str, schema: str, name: str) -> str:
     return (
         "SELECT tag_name, tag_value "
         "FROM system.information_schema.table_tags "
-        f"WHERE catalog_name = '{catalog}' "
-        f"AND schema_name = '{schema}' "
-        f"AND table_name = '{name}'"
+        f"WHERE catalog_name = {_sql_quote_literal(catalog)} "
+        f"AND schema_name = {_sql_quote_literal(schema)} "
+        f"AND table_name = {_sql_quote_literal(name)}"
     )
 
 
@@ -215,7 +215,9 @@ class GovernanceCapturer:
         rows = self._rows(
             "SELECT column_name, function_name, using_columns "
             "FROM system.information_schema.column_masks "
-            f"WHERE catalog_name = '{c}' AND schema_name = '{s}' AND table_name = '{n}'"
+            f"WHERE catalog_name = {_sql_quote_literal(c)} "
+            f"AND schema_name = {_sql_quote_literal(s)} "
+            f"AND table_name = {_sql_quote_literal(n)}"
         )
         out: list[ColumnMaskEntry] = []
         for r in rows:
