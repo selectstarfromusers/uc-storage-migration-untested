@@ -31,6 +31,16 @@ class ObjectRecord:
     owner: Optional[str]
     created_at: Optional[datetime]
     last_altered: Optional[datetime]
+    requires_pipeline_handling: bool = False
+    size_bytes: Optional[int] = None
+    tag_count: Optional[int] = None
+    grant_count: Optional[int] = None
+    has_row_filter: Optional[bool] = None
+    has_column_mask: Optional[bool] = None
+
+
+def _requires_pipeline_handling(table_type: Optional[str]) -> bool:
+    return table_type in {"MATERIALIZED_VIEW", "STREAMING_TABLE"}
 
 
 def _account_class(url: Optional[str], *, old: str, new: str) -> str:

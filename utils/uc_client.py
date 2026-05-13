@@ -29,6 +29,7 @@ class ExternalLocationRecord:
     url: str
     credential_name: str
     read_only: bool
+    region: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class UcClient:
                 url=el["url"],
                 credential_name=el["credential_name"],
                 read_only=el.get("read_only", False),
+                region=el.get("region"),
             )
             for el in resp.get("external_locations", [])
         ]

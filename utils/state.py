@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import (
-    StructType, StructField, StringType, TimestampType,
+    StructType, StructField, StringType, TimestampType, BooleanType, LongType,
 )
 
 from utils.discovery import ObjectRecord, Classification
@@ -24,6 +24,12 @@ INVENTORY_SCHEMA = StructType([
     StructField("owner", StringType(), True),
     StructField("created_at", TimestampType(), True),
     StructField("last_altered", TimestampType(), True),
+    StructField("requires_pipeline_handling", BooleanType(), False),
+    StructField("size_bytes", LongType(), True),
+    StructField("tag_count", LongType(), True),
+    StructField("grant_count", LongType(), True),
+    StructField("has_row_filter", BooleanType(), True),
+    StructField("has_column_mask", BooleanType(), True),
     StructField("classification", StringType(), False),
     StructField("captured_at", TimestampType(), False),
 ])
@@ -38,7 +44,7 @@ class InventoryWriter:
     def records_to_dataframe(
         self, records: Iterable[tuple[ObjectRecord, Classification]]
     ) -> DataFrame:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         rows = []
         for rec, classification in records:
             rows.append({

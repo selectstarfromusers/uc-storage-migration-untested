@@ -1,9 +1,9 @@
 """Decision-report logic and markdown rendering."""
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Literal
 
 from utils.discovery import ObjectRecord, Classification
@@ -41,11 +41,12 @@ def compute_recommendation(
     n_new = len(new_records)
     bytes_gb = bytes_on_new / (1024 ** 3)
     owners = {r.owner for r in new_records if r.owner}
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     oldest_age_days = 0
     for r in new_records:
         if r.created_at:
-            oldest_age_days = max(oldest_age_days, (now - r.created_at).days)
+            created = r.created_at.replace(tzinfo=None) if r.created_at.tzinfo else r.created_at
+            oldest_age_days = max(oldest_age_days, (now - created).days)
 
     # Any object on new older than threshold → forward
     if oldest_age_days > thresholds.max_age_days_on_new:
@@ -94,23 +95,90 @@ def compute_recommendation(
     )
 
 
+_CLASSIFICATION_ORDER = [
+    "consistent_old",
+    "consistent_new",
+    "drift_managed_on_old",
+    "external_on_old",
+    "external_on_new",
+    "unknown_account",
+    "path_missing",
+]
+
+
 def render_summary_markdown(
     *,
     records: list[tuple[ObjectRecord, Classification]],
     recommendation: Recommendation,
 ) -> str:
     counts: Counter = Counter(c for _, c in records)
+
+    # Per-catalog classification breakdown
+    per_catalog: dict[str, Counter] = defaultdict(Counter)
+    for r, c in records:
+        per_catalog[r.catalog][c] += 1
+
+    # Top catalogs by drift count
+    drift_by_catalog = sorted(
+        ((cat, ctr.get("drift_managed_on_old", 0)) for cat, ctr in per_catalog.items()),
+        key=lambda x: x[1], reverse=True,
+    )[:10]
+
+    # Pipeline-handling objects (MVs / streaming tables)
+    pipeline_objs = [r for r, _ in records if r.requires_pipeline_handling]
+
+    # unknown_account objects need human review
+    unknown_objs = [r for r, c in records if c == "unknown_account"]
+
     lines = ["## Inventory summary", "", "| Classification | Count |", "|---|---:|"]
-    for cls in [
-        "consistent_old",
-        "consistent_new",
-        "drift_managed_on_old",
-        "external_on_old",
-        "external_on_new",
-        "unknown_account",
-        "path_missing",
-    ]:
+    for cls in _CLASSIFICATION_ORDER:
         lines.append(f"| {cls} | {counts.get(cls, 0)} |")
+
+    lines += ["", "## Per-catalog breakdown", ""]
+    header = "| Catalog | " + " | ".join(_CLASSIFICATION_ORDER) + " |"
+    sep = "|---|" + "---:|" * len(_CLASSIFICATION_ORDER)
+    lines.append(header)
+    lines.append(sep)
+    for catalog in sorted(per_catalog):
+        row = "| " + catalog + " | " + " | ".join(
+            str(per_catalog[catalog].get(c, 0)) for c in _CLASSIFICATION_ORDER
+        ) + " |"
+        lines.append(row)
+
+    lines += ["", "## Top catalogs by drift_managed_on_old", ""]
+    if drift_by_catalog and drift_by_catalog[0][1] > 0:
+        lines += ["| Catalog | drift count |", "|---|---:|"]
+        for cat, cnt in drift_by_catalog:
+            if cnt > 0:
+                lines.append(f"| {cat} | {cnt} |")
+    else:
+        lines.append("_No drift objects found._")
+
+    lines += ["", "## Pipeline-handling objects (MV / streaming tables)", ""]
+    if pipeline_objs:
+        lines += [
+            f"{len(pipeline_objs)} object(s) flagged as requiring pipeline-owner coordination.",
+            "These are NOT auto-migrated; pipeline owners must do a full refresh after upstream migration.",
+            "",
+            "| FQN | table_type |",
+            "|---|---|",
+        ]
+        for r in pipeline_objs[:50]:
+            lines.append(f"| `{r.catalog}.{r.schema}.{r.name}` | {r.table_type} |")
+        if len(pipeline_objs) > 50:
+            lines.append(f"_(+ {len(pipeline_objs) - 50} more)_")
+    else:
+        lines.append("_None._")
+
+    lines += ["", "## unknown_account objects (needs human review)", ""]
+    if unknown_objs:
+        lines += ["| FQN | storage_path |", "|---|---|"]
+        for r in unknown_objs[:50]:
+            lines.append(f"| `{r.catalog}.{r.schema}.{r.name}` | {r.storage_path} |")
+        if len(unknown_objs) > 50:
+            lines.append(f"_(+ {len(unknown_objs) - 50} more)_")
+    else:
+        lines.append("_None._")
 
     lines += [
         "",
