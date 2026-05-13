@@ -104,11 +104,9 @@ for r in validated_rows:
           f"parent={result.parent_managed_location_match})")
 
 if results_rows:
-    df = spark.createDataFrame(results_rows, schema=VALIDATION_RESULTS_SCHEMA)
-    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(
-        f"{OPS_SCHEMA}.validation_results"
-    )
-    pass_count = sum(1 for r in results_rows if r[-3])  # overall_pass column
+    writer.overwrite(results_rows)
+    _OVERALL_PASS_IDX = VALIDATION_RESULTS_SCHEMA.fieldNames().index("overall_pass")
+    pass_count = sum(1 for r in results_rows if r[_OVERALL_PASS_IDX])
     print(f"\n{pass_count} / {len(results_rows)} passed all four evidence layers.")
 
 # COMMAND ----------

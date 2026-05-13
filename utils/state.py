@@ -127,7 +127,16 @@ class MigrationLog:
         ).saveAsTable(self._table)
 
     def claim(self, *, catalog: str, schema: str, name: str, object_type: str, actor: str) -> bool:
-        """Atomically claim a row for migration. Returns True if claimed, False if already claimed by someone else."""
+        """Atomically claim a row for migration.
+
+        Returns True only when:
+          - The row was newly inserted by this call (first claim), OR
+          - The row was previously claimed by `actor` and is not yet validated (resume).
+
+        Returns False when:
+          - Another actor already claimed the row (`claimed_by != actor`)
+          - The row's status is already 'validated' (idempotency: skip on re-run)
+        """
         now = _now_naive_utc()
 
         candidate = self._spark.createDataFrame(
@@ -137,6 +146,8 @@ class MigrationLog:
         )
         candidate.createOrReplaceTempView("_mig_log_candidate")
 
+        # MERGE INSERT is the atomic "first to claim wins". For an existing row
+        # it is a no-op; the SELECT below reflects the current persistent state.
         self._spark.sql(f"""
             MERGE INTO {self._table} AS t
             USING _mig_log_candidate AS s
@@ -146,11 +157,16 @@ class MigrationLog:
 
         rows = self._spark.sql(
             f"SELECT claimed_by, status FROM {self._table} "
-            f"WHERE catalog = '{catalog}' AND schema = '{schema}' AND name = '{name}'"
+            f"WHERE catalog = {self._to_sql_literal(catalog)} "
+            f"  AND schema = {self._to_sql_literal(schema)} "
+            f"  AND name = {self._to_sql_literal(name)}"
         ).collect()
         if not rows:
             return False
-        return rows[0]["claimed_by"] == actor
+        row = rows[0]
+        if row["status"] == "validated":
+            return False  # already migrated; do not re-execute
+        return row["claimed_by"] == actor
 
     def update(self, *, catalog: str, schema: str, name: str, **fields) -> None:
         """Update fields for a claimed row."""
@@ -158,7 +174,9 @@ class MigrationLog:
         sets += f", updated_at = {self._to_sql_literal(_now_naive_utc())}"
         self._spark.sql(
             f"UPDATE {self._table} SET {sets} "
-            f"WHERE catalog = '{catalog}' AND schema = '{schema}' AND name = '{name}'"
+            f"WHERE catalog = {self._to_sql_literal(catalog)} "
+            f"  AND schema = {self._to_sql_literal(schema)} "
+            f"  AND name = {self._to_sql_literal(name)}"
         )
 
     @staticmethod
@@ -204,3 +222,14 @@ class ValidationResultsWriter:
         self._spark.createDataFrame([], schema=VALIDATION_RESULTS_SCHEMA).write.format(
             "delta"
         ).mode("ignore").saveAsTable(self._table)
+
+    def overwrite(self, rows: list[tuple]) -> None:
+        """Replace the table contents with the given rows.
+
+        Each row must match `VALIDATION_RESULTS_SCHEMA` field order exactly.
+        Used by `04_validation` which produces the full result set per run.
+        """
+        df = self._spark.createDataFrame(rows, schema=VALIDATION_RESULTS_SCHEMA)
+        df.write.format("delta").mode("overwrite").option(
+            "overwriteSchema", "true"
+        ).saveAsTable(self._table)
