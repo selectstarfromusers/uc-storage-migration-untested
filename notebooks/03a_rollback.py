@@ -62,6 +62,7 @@ import json
 
 from utils.discovery import ObjectRecord, classify_object
 from utils.governance import GovernanceCapturer
+from utils.reporting import DecisionThresholds, compute_recommendation
 from utils.sql import quote_fqn
 from utils.state import MigrationLog, SnapshotWriter
 
@@ -80,6 +81,92 @@ if not new_objects and not DRY_RUN:
 
 # COMMAND ----------
 # MAGIC %md
+# MAGIC ## Pre-flight — recompute recommendation, probe storage access
+
+# COMMAND ----------
+# 1. Reconfirm rollback is still feasible against the current inventory state.
+def _rec_to_object_record(r):
+    return ObjectRecord(
+        catalog=r["catalog"], schema=r["schema"], name=r["name"],
+        object_type=r["object_type"], table_type=r["table_type"],
+        data_source_format=r["data_source_format"],
+        storage_path=r["storage_path"],
+        parent_managed_location=r["parent_managed_location"],
+        owner=r["owner"], created_at=r["created_at"], last_altered=r["last_altered"],
+        requires_pipeline_handling=r["requires_pipeline_handling"],
+        size_bytes=r["size_bytes"], tag_count=r["tag_count"],
+        grant_count=r["grant_count"],
+        has_row_filter=r["has_row_filter"], has_column_mask=r["has_column_mask"],
+    )
+
+bytes_on_new = sum(r["size_bytes"] or 0 for r, c in records if c == "consistent_new")
+classified_for_rec = [(_rec_to_object_record(r), c) for r, c in records]
+recommendation = compute_recommendation(
+    classified_for_rec, thresholds=DecisionThresholds(), bytes_on_new=bytes_on_new,
+)
+print(f"Current recommendation verdict: {recommendation.verdict}")
+print(f"  {recommendation.why}")
+
+if not DRY_RUN:
+    assert recommendation.verdict.startswith("ROLLBACK"), (
+        f"Refusing to roll back: current recommendation is {recommendation.verdict}. "
+        f"Re-run 01_discovery and 02_decision_report to reassess."
+    )
+
+# 2. Probe storage access on both old and new accounts (read+write).
+def _probe_rw(path: str) -> tuple[bool, bool]:
+    """Return (read_ok, write_ok). Cheap test: ls then write+delete a tiny marker."""
+    try:
+        dbutils.fs.ls(path)  # noqa: F821
+        read_ok = True
+    except Exception as e:
+        print(f"  read FAILED on {path}: {e}")
+        read_ok = False
+    marker = f"{path.rstrip('/')}/._rollback_probe"
+    try:
+        dbutils.fs.put(marker, "probe", True)  # noqa: F821
+        dbutils.fs.rm(marker)  # noqa: F821
+        write_ok = True
+    except Exception as e:
+        print(f"  write FAILED on {path}: {e}")
+        write_ok = False
+    return read_ok, write_ok
+
+# Probe one representative path on each side
+probes = []
+for r in rows:
+    if r["storage_path"]:
+        if f"@{OLD_STORAGE_ACCOUNT}." in r["storage_path"]:
+            probes.append(("old", r["storage_path"]))
+            break
+for r in rows:
+    if r["storage_path"]:
+        if f"@{NEW_STORAGE_ACCOUNT}." in r["storage_path"]:
+            probes.append(("new", r["storage_path"]))
+            break
+
+for label, p in probes:
+    read_ok, write_ok = _probe_rw(p)
+    print(f"  {label} storage probe @ {p}: read={read_ok} write={write_ok}")
+    if not DRY_RUN:
+        assert read_ok and write_ok, f"{label} storage probe failed; cannot proceed."
+
+# 3. ALTER CATALOG dry-run check.
+# UC may reject ALTER CATALOG SET MANAGED LOCATION when child schemas have
+# managed_locations that conflict with the new target. After all `consistent_new`
+# objects are dropped and all schemas are reverted (Step 3), the catalog ALTER
+# should succeed. Surface catalogs that currently have schemas with non-old
+# managed_locations as a warning so the user knows what to expect.
+catalogs_with_new_schemas: set[str] = set()
+for r in rows:
+    parent = r["parent_managed_location"]
+    if parent and f"@{NEW_STORAGE_ACCOUNT}." in parent:
+        catalogs_with_new_schemas.add(r["catalog"])
+print(f"Catalogs whose schemas still point at new storage (will be reverted in Step 3): "
+      f"{sorted(catalogs_with_new_schemas)}")
+
+# COMMAND ----------
+# MAGIC %md
 # MAGIC ## Step 1 — Capture governance state into object_metadata_snapshot
 
 # COMMAND ----------
@@ -90,12 +177,15 @@ snap_writer = SnapshotWriter(spark=spark, table_name=f"{OPS_SCHEMA}.object_metad
 snap_writer.ensure_exists()
 
 capturer = GovernanceCapturer(spark=spark)
+owned_objects: list = []  # objects this runner successfully claimed; only these are dropped
 
 for r in new_objects:
     if not mig_log.claim(catalog=r["catalog"], schema=r["schema"], name=r["name"],
                          object_type=r["object_type"], actor=ACTOR):
-        print(f"  SKIP (claimed by someone else): {r['catalog']}.{r['schema']}.{r['name']}")
+        print(f"  SKIP (claimed by another runner or already validated): "
+              f"{r['catalog']}.{r['schema']}.{r['name']}")
         continue
+    owned_objects.append(r)
     snap = capturer.capture(catalog=r["catalog"], schema=r["schema"],
                             name=r["name"], object_type=r["object_type"])
     snap_json = json.dumps({
@@ -117,9 +207,14 @@ for r in new_objects:
         mig_log.update(catalog=r["catalog"], schema=r["schema"], name=r["name"],
                        status="snapshot_taken")
 
+print(f"Owned by this runner: {len(owned_objects)} / {len(new_objects)} objects")
+
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## Step 2 — Drop new-storage objects (in dependency order)
+# MAGIC
+# MAGIC Only objects this runner claimed in Step 1 are dropped. Objects claimed by
+# MAGIC a concurrent runner are skipped; that runner is responsible for them.
 
 # COMMAND ----------
 def _drop_sql(obj_type: str, catalog: str, schema: str, name: str) -> str:
@@ -128,9 +223,12 @@ def _drop_sql(obj_type: str, catalog: str, schema: str, name: str) -> str:
 
 
 # Sort: tables before volumes, then alphabetically
-new_objects_sorted = sorted(new_objects, key=lambda r: (r["object_type"] != "TABLE", r["catalog"], r["schema"], r["name"]))
+owned_sorted = sorted(
+    owned_objects,
+    key=lambda r: (r["object_type"] != "TABLE", r["catalog"], r["schema"], r["name"]),
+)
 
-for r in new_objects_sorted:
+for r in owned_sorted:
     sql = _drop_sql(r["object_type"], r["catalog"], r["schema"], r["name"])
     if DRY_RUN:
         print(f"  DRY: {sql}")
@@ -138,7 +236,7 @@ for r in new_objects_sorted:
         try:
             spark.sql(sql)
             mig_log.update(catalog=r["catalog"], schema=r["schema"], name=r["name"],
-                           status="validated")
+                           status="dropped")
             print(f"  dropped: {r['catalog']}.{r['schema']}.{r['name']}")
         except Exception as e:
             mig_log.update(catalog=r["catalog"], schema=r["schema"], name=r["name"],
