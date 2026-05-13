@@ -8,6 +8,7 @@ from utils.uc_client import (
     SchemaRecord,
     ExternalLocationRecord,
     MetastoreInfo,
+    StorageCredentialRecord,
 )
 
 
@@ -135,3 +136,40 @@ class TestListExternalLocations:
             credential_name="old_cred",
             read_only=False,
         )
+
+
+class TestListStorageCredentials:
+    def test_parses_credentials(self):
+        rest = MagicMock()
+        rest.get.return_value = {
+            "storage_credentials": [
+                {
+                    "name": "old_cred",
+                    "owner": "u1",
+                    "read_only": False,
+                    "used_for_managed_storage": True,
+                    "azure_managed_identity": {"access_connector_id": "x"},
+                },
+                {
+                    "name": "new_cred",
+                    "owner": "u2",
+                    "read_only": True,
+                    "azure_service_principal": {"client_id": "y"},
+                },
+            ]
+        }
+        client = UcClient(sdk=MagicMock(), rest=rest)
+
+        result = client.list_storage_credentials()
+
+        assert len(result) == 2
+        assert result[0] == StorageCredentialRecord(
+            name="old_cred",
+            credential_type="azure_managed_identity",
+            owner="u1",
+            read_only=False,
+            used_for_managed_storage=True,
+        )
+        assert result[1].credential_type == "azure_service_principal"
+        assert result[1].read_only is True
+        rest.get.assert_called_with("/api/2.1/unity-catalog/storage-credentials")

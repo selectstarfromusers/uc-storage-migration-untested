@@ -33,6 +33,15 @@ class ExternalLocationRecord:
 
 
 @dataclass(frozen=True)
+class StorageCredentialRecord:
+    name: str
+    credential_type: str          # "AzureManagedIdentity" | "AzureServicePrincipal" | "AccessConnector" | ...
+    owner: Optional[str]
+    read_only: bool
+    used_for_managed_storage: bool
+
+
+@dataclass(frozen=True)
 class MetastoreInfo:
     metastore_id: str
     name: str
@@ -100,3 +109,22 @@ class UcClient:
             )
             for el in resp.get("external_locations", [])
         ]
+
+    def list_storage_credentials(self) -> list[StorageCredentialRecord]:
+        resp = self._rest.get("/api/2.1/unity-catalog/storage-credentials")
+        out = []
+        for sc in resp.get("storage_credentials", []):
+            cred_type = next(
+                (k for k in ("azure_managed_identity", "azure_service_principal",
+                             "azure_access_connector", "aws_iam_role", "gcp_service_account_key")
+                 if k in sc),
+                "unknown",
+            )
+            out.append(StorageCredentialRecord(
+                name=sc["name"],
+                credential_type=cred_type,
+                owner=sc.get("owner"),
+                read_only=sc.get("read_only", False),
+                used_for_managed_storage=sc.get("used_for_managed_storage", False),
+            ))
+        return out
