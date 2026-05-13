@@ -6,9 +6,10 @@ after a misordered ADLS migration. See
 
 ## Status
 
-**Plan 1 complete:** `01_discovery.py` and `02_decision_report.py` are operational.
-`utils/` modules are unit-tested. Migration playbooks (rollback, forward-migrate,
-validation) are scheduled for Plan 2.
+**Plan 1 + Plan 2 complete:** discovery, decision report, rollback,
+forward-migrate, and four-layer validation all operational. `utils/`
+modules carry the testable logic; `notebooks/` are thin Databricks
+orchestrators.
 
 ## Install (local dev)
 
@@ -20,29 +21,22 @@ validation) are scheduled for Plan 2.
 
     pytest
 
-Locally requires `pyspark` and `delta-spark` for `tests/test_state.py`. The
-other test modules use only stdlib + `pytest-mock`. On Databricks, pyspark
-is preinstalled.
+Locally requires `pyspark` and `delta-spark` for the Spark-dependent test
+modules. On Databricks, pyspark is preinstalled.
 
 ## Run (customer workspace)
 
-1. Upload `utils/` and `notebooks/` to the workspace.
-2. Open `notebooks/01_discovery.py`, edit the config cell:
-   - `OLD_STORAGE_ACCOUNT`, `NEW_STORAGE_ACCOUNT`
-   - `CATALOG_ALLOWLIST` (empty = all catalogs)
-   - `OPS_SCHEMA` (default `main._migration_ops`)
-3. Run all cells. Result: `<OPS_SCHEMA>.inventory` is written.
-4. Open `notebooks/02_decision_report.py`. Run all cells. Result: markdown
-   recommendation printed.
+1. Upload `utils/` and `notebooks/` to the workspace, side by side.
+2. Run notebooks in order: `01_discovery` → `02_decision_report` →
+   either `03a_rollback` or `03b_forward_migrate` → `04_validation`.
+3. Each notebook has a config cell. Defaults are `DRY_RUN=True` for the
+   mutating notebooks. Set `CONFIRMED=True` and `DRY_RUN=False` only after
+   reviewing the planned operations.
 
 ## Layout
 
-- `utils/` — pure-Python, pytest-tested modules (paths, sql, discovery, reporting, ...)
-- `notebooks/` — Databricks notebooks that orchestrate the utils
+- `utils/` — pure-Python modules (paths, sql, discovery, reporting,
+  governance, migration, validation, preflight, ...)
+- `notebooks/` — Databricks notebooks (orchestrators)
 - `tests/` — pytest suite for `utils/`
-- `docs/` — spec and plans
-
-## Plan 2 (forthcoming)
-
-`03a_rollback.py`, `03b_forward_migrate.py`, `04_validation.py`. Built on the
-discovery foundation that Plan 1 ships.
+- `docs/` — design spec + implementation plans
