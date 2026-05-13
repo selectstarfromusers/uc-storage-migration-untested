@@ -44,3 +44,40 @@ def test_write_inventory_creates_dataframe_with_classification(spark, tmp_path):
     assert len(rows) == 1
     assert rows[0]["classification"] == "drift_managed_on_old"
     assert rows[0]["catalog"] == "c"
+
+
+def test_migration_log_schema_has_required_columns():
+    from utils.state import MIGRATION_LOG_SCHEMA
+    names = set(MIGRATION_LOG_SCHEMA.fieldNames())
+    required = {"catalog", "schema", "name", "object_type", "status",
+                "claimed_by", "claimed_at", "staging_fqn", "pre_migration_fqn",
+                "error_trace", "updated_at"}
+    assert required.issubset(names)
+
+
+def test_snapshot_schema_has_required_columns():
+    from utils.state import OBJECT_METADATA_SNAPSHOT_SCHEMA
+    names = set(OBJECT_METADATA_SNAPSHOT_SCHEMA.fieldNames())
+    assert {"catalog", "schema", "name", "snapshot_json", "captured_at"}.issubset(names)
+
+
+def test_validation_results_schema_has_required_columns():
+    from utils.state import VALIDATION_RESULTS_SCHEMA
+    names = set(VALIDATION_RESULTS_SCHEMA.fieldNames())
+    required = {
+        "metadata_location_ok", "delta_log_at_new_ok", "input_file_name_ok",
+        "parent_managed_location_match", "grants_ok", "owner_ok",
+        "overall_pass", "evidence_json", "validated_at",
+    }
+    assert required.issubset(names)
+
+
+def test_migration_log_to_sql_literal_handles_types():
+    from utils.state import MigrationLog
+    from datetime import datetime
+    assert MigrationLog._to_sql_literal(None) == "NULL"
+    assert MigrationLog._to_sql_literal(True) == "TRUE"
+    assert MigrationLog._to_sql_literal(42) == "42"
+    assert MigrationLog._to_sql_literal("it's") == "'it''s'"
+    ts = datetime(2026, 5, 13, 10, 0, 0)
+    assert MigrationLog._to_sql_literal(ts) == "TIMESTAMP '2026-05-13T10:00:00'"
