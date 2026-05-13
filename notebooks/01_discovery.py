@@ -243,13 +243,39 @@ def parent_managed_location(catalog: str, schema: str) -> str | None:
     return schema_locs.get((catalog, schema)) or catalog_locs.get(catalog)
 
 
+# Visibility for size collection — populated as the loop runs.
+_size_skipped: list[tuple[str, str, str]] = []  # (fqn, fmt-or-null, reason)
+
+
 def _collect_size(catalog: str, schema: str, name: str, fmt: str | None) -> int | None:
-    if not COLLECT_SIZES or fmt != "DELTA":
+    """Return sizeInBytes via DESCRIBE DETAIL, or None.
+
+    Treats both "DELTA" and null/empty `fmt` as Delta-capable. UC's
+    information_schema.tables.data_source_format is NULL for managed tables
+    (the format is implicit), so a strict 'DELTA' equality check would
+    silently skip every managed Delta table. DESCRIBE DETAIL itself will
+    refuse if the table isn't actually Delta — we catch that exception and
+    log the reason.
+    """
+    if not COLLECT_SIZES:
+        return None
+    fmt_upper = (fmt or "").upper()
+    fqn_display = f"{catalog}.{schema}.{name}"
+    if fmt_upper and fmt_upper != "DELTA":
+        _size_skipped.append((fqn_display, fmt or "(null)", f"non-Delta format: {fmt_upper}"))
         return None
     try:
         row = spark.sql(f"DESCRIBE DETAIL {quote_fqn(catalog, schema, name)}").first()
-        return int(row["sizeInBytes"]) if row and "sizeInBytes" in row.asDict() else None
-    except Exception:
+        if row is None:
+            _size_skipped.append((fqn_display, fmt or "(null)", "DESCRIBE DETAIL returned no row"))
+            return None
+        d = row.asDict()
+        if "sizeInBytes" not in d or d["sizeInBytes"] is None:
+            _size_skipped.append((fqn_display, fmt or "(null)", "sizeInBytes column absent or null"))
+            return None
+        return int(d["sizeInBytes"])
+    except Exception as e:
+        _size_skipped.append((fqn_display, fmt or "(null)", f"{type(e).__name__}: {str(e)[:120]}"))
         return None
 
 
@@ -320,6 +346,20 @@ for _, row in volumes_df.iterrows():
 
 print(f"Classified {len(records)} objects")
 print(f"DESCRIBE EXTENDED fallback resolved {_fallback_count} objects that had null info_schema.storage_path")
+
+if COLLECT_SIZES:
+    sized = sum(1 for r, _ in records if r.size_bytes is not None)
+    print(f"Sizes collected for {sized} / {len(records)} objects (skipped: {len(_size_skipped)})")
+    if _size_skipped:
+        # Group skip reasons for a compact summary
+        from collections import Counter
+        reasons = Counter(s[2].split(":")[0] for s in _size_skipped)
+        print("  skip reasons (top):")
+        for reason, n in reasons.most_common(5):
+            print(f"    {reason}: {n}")
+        print("  first 5 skipped objects:")
+        for fqn, fmt, reason in _size_skipped[:5]:
+            print(f"    {fqn} (fmt={fmt}): {reason}")
 
 # COMMAND ----------
 # MAGIC %md
