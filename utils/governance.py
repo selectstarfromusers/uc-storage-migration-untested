@@ -111,13 +111,15 @@ def build_replay_owner_sql(
 
 def build_replay_tags_sql(
     *, catalog: str, schema: str, name: str, tags: list[TagEntry],
+    object_type: str = "TABLE",
 ) -> Optional[str]:
     if not tags:
         return None
+    kw = _object_keyword(object_type)
     parts = ", ".join(
         f"{_sql_quote_literal(t.name)} = {_sql_quote_literal(t.value)}" for t in tags
     )
-    return f"ALTER TABLE {quote_fqn(catalog, schema, name)} SET TAGS ({parts})"
+    return f"ALTER {kw} {quote_fqn(catalog, schema, name)} SET TAGS ({parts})"
 
 
 def build_replay_comment_sql(
@@ -170,6 +172,16 @@ class GovernanceCapturer:
         except Exception:
             return []
 
+    @staticmethod
+    def _describe_sql(object_type: str, fqn: str) -> str:
+        """Return the correct DESCRIBE syntax: 'DESCRIBE TABLE EXTENDED <fqn>' or 'DESCRIBE VOLUME <fqn>'.
+
+        Databricks grammar is DESCRIBE [TABLE|VOLUME] [EXTENDED] name. EXTENDED is
+        only supported for tables; volumes use the shorter form.
+        """
+        kw = _object_keyword(object_type)
+        return f"DESCRIBE {kw} EXTENDED {fqn}" if kw == "TABLE" else f"DESCRIBE {kw} {fqn}"
+
     def _capture_grants(self, c, s, n, ot) -> list[GrantEntry]:
         return parse_show_grants_rows(self._rows(build_show_grants_sql(
             catalog=c, schema=s, name=n, object_type=ot,
@@ -179,8 +191,7 @@ class GovernanceCapturer:
         return parse_show_tags_rows(self._rows(build_show_tags_sql(catalog=c, schema=s, name=n)))
 
     def _capture_owner(self, c, s, n, ot) -> Optional[str]:
-        kw = _object_keyword(ot)
-        rows = self._rows(f"DESCRIBE EXTENDED {kw} {quote_fqn(c, s, n)}")
+        rows = self._rows(self._describe_sql(ot, quote_fqn(c, s, n)))
         for r in rows:
             for k, v in r.items():
                 if k.lower() in {"col_name", "info_name"} and str(v).lower() == "owner":
@@ -219,7 +230,7 @@ class GovernanceCapturer:
         return out
 
     def _capture_comments(self, c, s, n, ot) -> tuple[Optional[str], dict[str, str]]:
-        rows = self._rows(f"DESCRIBE EXTENDED {_object_keyword(ot)} {quote_fqn(c, s, n)}")
+        rows = self._rows(self._describe_sql(ot, quote_fqn(c, s, n)))
         table_comment: Optional[str] = None
         column_comments: dict[str, str] = {}
         in_columns = True
@@ -267,7 +278,9 @@ class GovernanceReplayer:
             except Exception as e:
                 warnings.append(f"owner replay failed (principal may no longer exist): {snap.owner}: {e}")
 
-        tag_sql = build_replay_tags_sql(catalog=c, schema=s, name=n, tags=snap.tags)
+        tag_sql = build_replay_tags_sql(
+            catalog=c, schema=s, name=n, tags=snap.tags, object_type=object_type,
+        )
         if tag_sql:
             try:
                 self._spark.sql(tag_sql)
@@ -282,16 +295,18 @@ class GovernanceReplayer:
             except Exception as e:
                 warnings.append(f"comment replay failed: {e}")
 
-        for k, v in snap.table_properties.items():
-            if k.startswith("delta."):
-                continue  # Delta-managed properties, skip
-            try:
-                self._spark.sql(
-                    f"ALTER TABLE {quote_fqn(c, s, n)} "
-                    f"SET TBLPROPERTIES ({_sql_quote_literal(k)} = {_sql_quote_literal(v)})"
-                )
-            except Exception as e:
-                warnings.append(f"property {k} replay failed: {e}")
+        # TBLPROPERTIES are table-only in UC; volumes have no analogous concept.
+        if object_type == "TABLE":
+            for k, v in snap.table_properties.items():
+                if k.startswith("delta."):
+                    continue  # Delta-managed properties, skip
+                try:
+                    self._spark.sql(
+                        f"ALTER TABLE {quote_fqn(c, s, n)} "
+                        f"SET TBLPROPERTIES ({_sql_quote_literal(k)} = {_sql_quote_literal(v)})"
+                    )
+                except Exception as e:
+                    warnings.append(f"property {k} replay failed: {e}")
 
         if snap.row_filter_name:
             warnings.append(

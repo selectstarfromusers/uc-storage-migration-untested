@@ -38,9 +38,14 @@ def resolve_storage_path(
         return info_schema_path
 
     fqn = quote_fqn(catalog, schema, name)
-    keyword = "VOLUME" if object_type == "VOLUME" else "TABLE"
+    # Databricks grammar: DESCRIBE [TABLE|VOLUME] [EXTENDED] name. EXTENDED only
+    # applies to tables; volumes use DESCRIBE VOLUME (no EXTENDED).
+    if object_type == "VOLUME":
+        describe_sql = f"DESCRIBE VOLUME {fqn}"
+    else:
+        describe_sql = f"DESCRIBE TABLE EXTENDED {fqn}"
     try:
-        rows = spark.sql(f"DESCRIBE EXTENDED {keyword} {fqn}").collect()
+        rows = spark.sql(describe_sql).collect()
     except Exception:
         return None
 

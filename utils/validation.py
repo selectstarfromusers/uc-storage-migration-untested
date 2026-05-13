@@ -79,7 +79,7 @@ def validate_object_on_new(
 
     # --- Layer 1: DESCRIBE EXTENDED → Location ---
     try:
-        rows = spark.sql(f"DESCRIBE EXTENDED TABLE {fqn}").collect()
+        rows = spark.sql(f"DESCRIBE TABLE EXTENDED {fqn}").collect()
         rendered = "\n".join(
             "\t".join(str(c) if c is not None else "" for c in (r.asDict().values() if hasattr(r, "asDict") else r))
             for r in rows
