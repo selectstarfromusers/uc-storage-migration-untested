@@ -63,7 +63,7 @@ from utils.state import VALIDATION_RESULTS_SCHEMA, ValidationResultsWriter
 
 validated_rows = spark.sql(
     f"SELECT m.catalog, m.schema, m.name, m.object_type, i.data_source_format, "
-    f"       i.parent_managed_location "
+    f"       i.parent_managed_location, i.table_type "
     f"FROM {OPS_SCHEMA}.migration_log m "
     f"JOIN {OPS_SCHEMA}.inventory i "
     f"  ON m.catalog = i.catalog AND m.schema = i.schema AND m.name = i.name "
@@ -85,6 +85,7 @@ for r in validated_rows:
         parent_managed_location=r["parent_managed_location"],
         is_delta=(r["data_source_format"] == "DELTA"),
         sample_limit=SAMPLE_LIMIT,
+        is_external=(r["table_type"] == "EXTERNAL"),
     )
     results_rows.append((
         result.catalog, result.schema, result.name,
