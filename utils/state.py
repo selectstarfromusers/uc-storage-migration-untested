@@ -45,14 +45,15 @@ class InventoryWriter:
     def records_to_dataframe(
         self, records: Iterable[tuple[ObjectRecord, Classification]]
     ) -> DataFrame:
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = _now_naive_utc()
         rows = []
         for rec, classification in records:
-            rows.append({
-                **asdict(rec),
-                "classification": classification,
-                "captured_at": now,
-            })
+            row = asdict(rec)
+            row["created_at"] = _to_naive_utc(row.get("created_at"))
+            row["last_altered"] = _to_naive_utc(row.get("last_altered"))
+            row["classification"] = classification
+            row["captured_at"] = now
+            rows.append(row)
         return self._spark.createDataFrame(rows, schema=INVENTORY_SCHEMA)
 
     def overwrite_delta(self, df: DataFrame, *, table_name: str) -> None:
@@ -112,6 +113,26 @@ VALIDATION_RESULTS_SCHEMA = StructType([
 
 def _now_naive_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _to_naive_utc(ts):
+    """Normalize a datetime / pandas.Timestamp to a tz-naive UTC datetime.
+
+    Spark's TimestampType expects tz-naive datetime objects. Timestamps coming
+    from `spark.sql(...).toPandas()` against `system.information_schema.*` are
+    tz-aware (UTC); passing them through `spark.createDataFrame` raises
+    'Cannot convert tz-aware Timestamp'. Strip the tz here so the writer is
+    robust to either input shape.
+    """
+    if ts is None:
+        return None
+    tz = getattr(ts, "tzinfo", None)
+    if tz is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    # pandas.Timestamp → datetime so Spark doesn't have to coerce.
+    if hasattr(ts, "to_pydatetime"):
+        ts = ts.to_pydatetime()
+    return ts
 
 
 class MigrationLog:
