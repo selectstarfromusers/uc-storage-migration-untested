@@ -107,8 +107,10 @@ print(f"external_on_old: {len(external_old)}")
 # COMMAND ----------
 fs = dbutils.fs  # noqa: F821
 
+from utils.migration import rewrite_account_in_path
+
 target_new_path = (
-    drift[0]["storage_path"].replace(f"@{OLD_STORAGE_ACCOUNT}.", f"@{NEW_STORAGE_ACCOUNT}.", 1)
+    rewrite_account_in_path(drift[0]["storage_path"], NEW_STORAGE_ACCOUNT)
     if drift else None
 )
 if target_new_path:
@@ -122,7 +124,7 @@ for r in drift + external_old:
     if not r["storage_path"]:
         continue
     old_p = r["storage_path"]
-    new_p = old_p.replace(f"@{OLD_STORAGE_ACCOUNT}.", f"@{NEW_STORAGE_ACCOUNT}.", 1)
+    new_p = rewrite_account_in_path(old_p, NEW_STORAGE_ACCOUNT)
     if not probe_path_exists(fs=fs, path=new_p):
         missing.append((r["catalog"], r["schema"], r["name"], new_p))
         continue

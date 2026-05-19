@@ -62,9 +62,23 @@ import json
 
 from utils.discovery import ObjectRecord, classify_object
 from utils.governance import GovernanceCapturer
+from utils.migration import rewrite_account_in_path
+from utils.paths import classify_account, parse_storage_url
 from utils.reporting import DecisionThresholds, compute_recommendation
 from utils.sql import quote_fqn
 from utils.state import MigrationLog, SnapshotWriter
+
+
+def _account_of(url):
+    p = parse_storage_url(url)
+    return p.account if p else None
+
+
+def _is_on(url, account):
+    return classify_account(_account_of(url), old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT) == (
+        "old" if account == OLD_STORAGE_ACCOUNT else
+        "new" if account == NEW_STORAGE_ACCOUNT else None
+    )
 
 assert not (not DRY_RUN and not CONFIRMED), (
     "DRY_RUN=False requires CONFIRMED=True. Set both flags explicitly."
@@ -135,15 +149,13 @@ def _probe_rw(path: str) -> tuple[bool, bool]:
 # Probe one representative path on each side
 probes = []
 for r in rows:
-    if r["storage_path"]:
-        if f"@{OLD_STORAGE_ACCOUNT}." in r["storage_path"]:
-            probes.append(("old", r["storage_path"]))
-            break
+    if r["storage_path"] and _is_on(r["storage_path"], OLD_STORAGE_ACCOUNT):
+        probes.append(("old", r["storage_path"]))
+        break
 for r in rows:
-    if r["storage_path"]:
-        if f"@{NEW_STORAGE_ACCOUNT}." in r["storage_path"]:
-            probes.append(("new", r["storage_path"]))
-            break
+    if r["storage_path"] and _is_on(r["storage_path"], NEW_STORAGE_ACCOUNT):
+        probes.append(("new", r["storage_path"]))
+        break
 
 for label, p in probes:
     read_ok, write_ok = _probe_rw(p)
@@ -160,7 +172,7 @@ for label, p in probes:
 catalogs_with_new_schemas: set[str] = set()
 for r in rows:
     parent = r["parent_managed_location"]
-    if parent and f"@{NEW_STORAGE_ACCOUNT}." in parent:
+    if parent and _is_on(parent, NEW_STORAGE_ACCOUNT):
         catalogs_with_new_schemas.add(r["catalog"])
 print(f"Catalogs whose schemas still point at new storage (will be reverted in Step 3): "
       f"{sorted(catalogs_with_new_schemas)}")
@@ -248,9 +260,6 @@ for r in owned_sorted:
 # MAGIC ## Step 3 — Revert schema managed_locations
 
 # COMMAND ----------
-from utils.paths import parse_abfss_url
-
-
 schemas_to_revert = []
 seen = set()
 for r in rows:
@@ -259,9 +268,9 @@ for r in rows:
         continue
     seen.add(key)
     parent = r["parent_managed_location"]
-    parsed = parse_abfss_url(parent)
+    parsed = parse_storage_url(parent)
     if parsed and parsed.account == NEW_STORAGE_ACCOUNT:
-        old_path = parent.replace(f"@{NEW_STORAGE_ACCOUNT}.", f"@{OLD_STORAGE_ACCOUNT}.", 1)
+        old_path = rewrite_account_in_path(parent, OLD_STORAGE_ACCOUNT)
         schemas_to_revert.append((r["catalog"], r["schema"], old_path))
 
 print(f"Schemas to revert: {len(schemas_to_revert)}")
@@ -301,9 +310,9 @@ catalogs = client.list_catalogs()
 for c in catalogs:
     if not c.storage_root:
         continue
-    parsed = parse_abfss_url(c.storage_root)
+    parsed = parse_storage_url(c.storage_root)
     if parsed and parsed.account == NEW_STORAGE_ACCOUNT:
-        old_path = c.storage_root.replace(f"@{NEW_STORAGE_ACCOUNT}.", f"@{OLD_STORAGE_ACCOUNT}.", 1)
+        old_path = rewrite_account_in_path(c.storage_root, OLD_STORAGE_ACCOUNT)
         sql = f"ALTER CATALOG {quote_fqn(c.name)} SET MANAGED LOCATION '{old_path}'"
         if DRY_RUN:
             print(f"  DRY: {sql}")

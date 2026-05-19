@@ -1,5 +1,8 @@
 import pytest
-from utils.paths import parse_abfss_url, classify_account, AdlsPath
+from utils.paths import (
+    parse_abfss_url, parse_s3_url, parse_storage_url, classify_account,
+    AdlsPath, S3Path,
+)
 
 
 class TestParseAbfssUrl:
@@ -44,3 +47,61 @@ class TestClassifyAccount:
 
     def test_case_insensitive(self):
         assert classify_account("OldAcct", old="oldacct", new="newacct") == "old"
+
+
+class TestParseS3Url:
+    def test_parses_basic_s3(self):
+        result = parse_s3_url("s3://mybucket/some/key")
+        assert result == S3Path(
+            account="mybucket",
+            container="",
+            path="some/key",
+            raw="s3://mybucket/some/key",
+        )
+
+    def test_parses_bucket_only(self):
+        result = parse_s3_url("s3://mybucket/")
+        assert result.account == "mybucket"
+        assert result.path == ""
+
+    def test_parses_bucket_with_no_trailing_slash(self):
+        result = parse_s3_url("s3://mybucket")
+        assert result.account == "mybucket"
+        assert result.path == ""
+
+    def test_parses_s3a_variant(self):
+        result = parse_s3_url("s3a://mybucket/some/key")
+        assert result.account == "mybucket"
+
+    def test_parses_s3n_variant(self):
+        result = parse_s3_url("s3n://mybucket/some/key")
+        assert result.account == "mybucket"
+
+    def test_returns_none_for_non_s3(self):
+        assert parse_s3_url("abfss://c@a.dfs.core.windows.net/x") is None
+        assert parse_s3_url("/Volumes/c/s/v/file") is None
+        assert parse_s3_url(None) is None
+        assert parse_s3_url("") is None
+
+    def test_normalizes_bucket_to_lowercase(self):
+        result = parse_s3_url("s3://MyBucket/x")
+        assert result.account == "mybucket"
+
+
+class TestParseStorageUrl:
+    def test_dispatches_to_abfss(self):
+        r = parse_storage_url("abfss://c@a.dfs.core.windows.net/x")
+        assert isinstance(r, AdlsPath)
+        assert r.account == "a"
+        assert r.scheme == "abfss"
+
+    def test_dispatches_to_s3(self):
+        r = parse_storage_url("s3://mybucket/x")
+        assert isinstance(r, S3Path)
+        assert r.account == "mybucket"
+        assert r.scheme == "s3"
+
+    def test_returns_none_for_unknown(self):
+        assert parse_storage_url("file:///tmp/x") is None
+        assert parse_storage_url("/Volumes/c/s/v/file") is None
+        assert parse_storage_url(None) is None

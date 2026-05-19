@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
-from utils.paths import parse_abfss_url
+from utils.paths import parse_storage_url
 from utils.sql import quote_fqn, parse_describe_extended_location
 
 
@@ -44,10 +44,13 @@ class _Fs(Protocol):
 def _hosts_in_paths(paths: list[str]) -> set[str]:
     out: set[str] = set()
     for p in paths:
-        parsed = parse_abfss_url(p)
+        parsed = parse_storage_url(p)
         if parsed:
             out.add(parsed.account)
     return out
+
+
+_STORAGE_URL_PREFIXES = ("abfss://", "s3://", "s3a://", "s3n://")
 
 
 def _parse_input_file_name_rows(rows) -> list[str]:
@@ -55,7 +58,7 @@ def _parse_input_file_name_rows(rows) -> list[str]:
     for r in rows:
         d = r.asDict() if hasattr(r, "asDict") else dict(r)
         for v in d.values():
-            if v and isinstance(v, str) and v.startswith("abfss://"):
+            if v and isinstance(v, str) and v.startswith(_STORAGE_URL_PREFIXES):
                 out.append(v)
                 break
     return out
@@ -87,7 +90,7 @@ def validate_object_on_new(
         )
         location = parse_describe_extended_location(rendered)
         evidence["describe_location"] = location
-        parsed = parse_abfss_url(location) if location else None
+        parsed = parse_storage_url(location) if location else None
         metadata_ok = parsed is not None and parsed.account == expected_new_account
     except Exception as e:
         metadata_ok = False
@@ -137,7 +140,7 @@ def validate_object_on_new(
         parent_ok = None
         evidence["parent_layer_skipped"] = "external object — Layer 4 N/A"
     elif parent_managed_location:
-        parent_parsed = parse_abfss_url(parent_managed_location)
+        parent_parsed = parse_storage_url(parent_managed_location)
         parent_ok = parent_parsed is not None and parent_parsed.account == expected_new_account
         evidence["parent_account"] = parent_parsed.account if parent_parsed else None
     else:
