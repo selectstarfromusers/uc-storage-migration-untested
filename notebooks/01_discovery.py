@@ -132,14 +132,22 @@ for el in ext_locs:
     print(f"  {el.name} -> {el.url} (cred={el.credential_name}, region={el.region}, read_only={el.read_only})")
 
 # Use an explicit Spark schema so an empty ext_locs list doesn't produce a schemaless DataFrame.
+# `region` is always NULL — UC's external-locations API doesn't return it.
+# isolation_mode + accessible_in_current_workspace are pulled through for diagnostics.
 _EXT_LOC_SCHEMA = StructType([
     StructField("name", StringType(), False),
     StructField("url", StringType(), False),
     StructField("credential_name", StringType(), False),
     StructField("read_only", BooleanType(), False),
     StructField("region", StringType(), True),
+    StructField("isolation_mode", StringType(), True),
+    StructField("accessible_in_current_workspace", BooleanType(), True),
 ])
-ext_rows = [(el.name, el.url, el.credential_name, el.read_only, el.region) for el in ext_locs]
+ext_rows = [
+    (el.name, el.url, el.credential_name, el.read_only, el.region,
+     el.isolation_mode, el.accessible_in_current_workspace)
+    for el in ext_locs
+]
 ext_df = spark.createDataFrame(ext_rows, schema=_EXT_LOC_SCHEMA)
 ext_df.write.format("delta").mode("overwrite").option(
     "overwriteSchema", "true"
@@ -248,21 +256,81 @@ def parent_managed_location(catalog: str, schema: str) -> str | None:
 _size_skipped: list[tuple[str, str, str]] = []  # (fqn, fmt-or-null, reason)
 
 
-def _collect_size(catalog: str, schema: str, name: str, fmt: str | None) -> int | None:
+VOLUME_SIZE_MAX_FILES = 10000          # cap files walked per volume
+VOLUME_SIZE_MAX_SECONDS_PER_VOLUME = 30  # cap wall time per volume
+
+
+def _collect_volume_size(path: str | None, fqn_display: str) -> int | None:
+    """Recursively sum file sizes under a volume's storage path via dbutils.fs.
+
+    Returns None on any failure (path missing, permission, timeout). Logs to
+    `_size_skipped` so the reason is visible in the summary at the end.
+
+    Bounded by VOLUME_SIZE_MAX_FILES and VOLUME_SIZE_MAX_SECONDS_PER_VOLUME so
+    a pathological volume can't stall discovery.
+    """
+    if not COLLECT_SIZES:
+        return None
+    if not path:
+        _size_skipped.append((fqn_display, "(volume)", "no storage_path"))
+        return None
+    import time
+    deadline = time.monotonic() + VOLUME_SIZE_MAX_SECONDS_PER_VOLUME
+    total = 0
+    files_seen = 0
+    stack = [path]
+    try:
+        while stack:
+            if time.monotonic() > deadline:
+                _size_skipped.append((fqn_display, "(volume)",
+                                       f"walk exceeded {VOLUME_SIZE_MAX_SECONDS_PER_VOLUME}s budget"))
+                return None
+            cur = stack.pop()
+            try:
+                entries = dbutils.fs.ls(cur)  # noqa: F821 (Databricks builtin)
+            except Exception as e:
+                # path doesn't exist or permission denied — log once, skip
+                _size_skipped.append((fqn_display, "(volume)",
+                                       f"ls({cur[:60]}...): {type(e).__name__}: {str(e)[:80]}"))
+                return None
+            for f in entries:
+                if files_seen >= VOLUME_SIZE_MAX_FILES:
+                    _size_skipped.append((fqn_display, "(volume)",
+                                           f"walk exceeded {VOLUME_SIZE_MAX_FILES} files"))
+                    return None
+                files_seen += 1
+                if f.isDir():
+                    stack.append(f.path)
+                else:
+                    total += int(f.size or 0)
+        return total
+    except Exception as e:
+        _size_skipped.append((fqn_display, "(volume)",
+                               f"{type(e).__name__}: {str(e)[:120]}"))
+        return None
+
+
+def _collect_size(catalog: str, schema: str, name: str, fmt: str | None,
+                   table_type: str | None = None) -> int | None:
     """Return sizeInBytes via DESCRIBE DETAIL, or None.
 
-    Treats both "DELTA" and null/empty `fmt` as Delta-capable. UC's
-    information_schema.tables.data_source_format is NULL for managed tables
-    (the format is implicit), so a strict 'DELTA' equality check would
-    silently skip every managed Delta table. DESCRIBE DETAIL itself will
-    refuse if the table isn't actually Delta — we catch that exception and
-    log the reason.
+    Treats Delta, null/empty fmt, and MATERIALIZED_VIEW / STREAMING_TABLE as
+    Delta-capable. UC's information_schema.tables.data_source_format is NULL
+    for managed tables and "UNKNOWN_DATA_SOURCE_FORMAT" for MVs/STs, so we
+    must look at table_type as a secondary signal. MVs and STs are
+    Delta-backed under the hood — DESCRIBE DETAIL works on them and returns
+    a valid sizeInBytes. Genuinely non-Delta tables get rejected by
+    DESCRIBE DETAIL itself; we catch and log.
     """
     if not COLLECT_SIZES:
         return None
     fmt_upper = (fmt or "").upper()
     fqn_display = f"{catalog}.{schema}.{name}"
-    if fmt_upper and fmt_upper != "DELTA":
+    delta_capable_table_types = {"MANAGED", "EXTERNAL", "MATERIALIZED_VIEW", "STREAMING_TABLE"}
+    is_delta_compat_fmt = (not fmt_upper) or fmt_upper == "DELTA"
+    is_delta_compat_type = table_type in delta_capable_table_types
+    # Skip only when both fmt and table_type say this is definitely not Delta-capable.
+    if not is_delta_compat_fmt and not is_delta_compat_type:
         _size_skipped.append((fqn_display, fmt or "(null)", f"non-Delta format: {fmt_upper}"))
         return None
     try:
@@ -306,7 +374,7 @@ for _, row in tables_df.iterrows():
         created_at=row.get("created"),
         last_altered=row.get("last_altered"),
         requires_pipeline_handling=_requires_pipeline_handling(row["table_type"]),
-        size_bytes=_collect_size(cat, sch, nm, fmt),
+        size_bytes=_collect_size(cat, sch, nm, fmt, table_type=row["table_type"]),
         tag_count=tag_counts.get((cat, sch, nm)),
         grant_count=grant_counts.get((cat, sch, nm)),
         has_row_filter=None,    # captured in Plan 2's metadata snapshot
@@ -325,6 +393,7 @@ for _, row in volumes_df.iterrows():
     if storage_path != raw_path and storage_path is not None:
         _fallback_count += 1
 
+    vol_fqn = f"{cat}.{sch}.{nm}"
     rec = ObjectRecord(
         catalog=cat, schema=sch, name=nm,
         object_type="VOLUME",
@@ -336,7 +405,7 @@ for _, row in volumes_df.iterrows():
         created_at=row.get("created"),
         last_altered=row.get("last_altered"),
         requires_pipeline_handling=False,
-        size_bytes=None,
+        size_bytes=_collect_volume_size(storage_path, vol_fqn),
         tag_count=None,
         grant_count=None,
         has_row_filter=None,

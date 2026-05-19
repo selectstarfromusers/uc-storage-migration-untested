@@ -29,7 +29,14 @@ class ExternalLocationRecord:
     url: str
     credential_name: str
     read_only: bool
+    # NOTE: UC's external-locations API does NOT return a region field. All
+    # external locations in a metastore must share the metastore's region by
+    # UC design, so cross-region cannot be derived from this list. Region
+    # stays Optional[None] for backward compat — get the metastore region from
+    # `w.metastores.summary().region` instead.
     region: Optional[str] = None
+    isolation_mode: Optional[str] = None
+    accessible_in_current_workspace: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -105,7 +112,10 @@ class UcClient:
                 url=el["url"],
                 credential_name=el["credential_name"],
                 read_only=el.get("read_only", False),
+                # Region is never present in the response; kept for back-compat.
                 region=el.get("region"),
+                isolation_mode=el.get("isolation_mode"),
+                accessible_in_current_workspace=el.get("accessible_in_current_workspace"),
             )
             for el in resp.get("external_locations", [])
         ]

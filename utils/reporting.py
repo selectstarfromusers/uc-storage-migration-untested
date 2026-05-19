@@ -106,12 +106,40 @@ _CLASSIFICATION_ORDER = [
 ]
 
 
+def _size_coverage(records: list[tuple[ObjectRecord, Classification]]) -> dict:
+    """Compute size-collection coverage stats for the summary block."""
+    # Only count objects that COULD have a size (skip VIEWs / path_missing).
+    sizable = [
+        r for r, c in records
+        if c != "path_missing" and r.table_type != "VIEW"
+    ]
+    sized = [r for r in sizable if r.size_bytes is not None]
+    total_bytes = sum(r.size_bytes or 0 for r in sized)
+    pct_missing = (
+        100.0 * (len(sizable) - len(sized)) / len(sizable) if sizable else 0.0
+    )
+    # By object_type
+    by_type = defaultdict(lambda: [0, 0])  # [total, sized]
+    for r in sizable:
+        by_type[r.object_type][0] += 1
+        if r.size_bytes is not None:
+            by_type[r.object_type][1] += 1
+    return {
+        "sized": len(sized),
+        "total_sizable": len(sizable),
+        "pct_missing": pct_missing,
+        "total_bytes": total_bytes,
+        "by_object_type": dict(by_type),
+    }
+
+
 def render_summary_markdown(
     *,
     records: list[tuple[ObjectRecord, Classification]],
     recommendation: Recommendation,
 ) -> str:
     counts: Counter = Counter(c for _, c in records)
+    coverage = _size_coverage(records)
 
     # Per-catalog classification breakdown
     per_catalog: dict[str, Counter] = defaultdict(Counter)
@@ -190,5 +218,27 @@ def render_summary_markdown(
         "",
         f"New-storage objects: {recommendation.new_object_count}, "
         f"bytes_on_new: {recommendation.bytes_on_new}",
+        "",
+        "## Size coverage",
+        "",
+        (f"**Sized:** {coverage['sized']} of {coverage['total_sizable']} objects "
+         f"({coverage['pct_missing']:.1f}% missing). Total measured bytes: "
+         f"{coverage['total_bytes']:,}."),
     ]
+    if coverage["pct_missing"] > 0:
+        lines.append("")
+        lines.append(
+            "_byte totals (bytes_on_new, drift_bytes) are **lower bounds** — "
+            "they exclude objects whose size couldn't be measured (typically "
+            "external tables, non-Delta formats, and unreachable volumes). "
+            "Treat the cost / time estimate as a floor, not a quote._"
+        )
+    if coverage["by_object_type"]:
+        lines += [
+            "",
+            "| Object type | sized / total |",
+            "|---|---|",
+        ]
+        for obj_type, (total, sized) in sorted(coverage["by_object_type"].items()):
+            lines.append(f"| {obj_type} | {sized} / {total} |")
     return "\n".join(lines)
