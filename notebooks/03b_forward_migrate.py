@@ -128,7 +128,13 @@ if target_new_path:
 
 missing = []
 partition_warnings = []
-for r in drift + external_old:
+# Pre-flight presence check only applies to EXTERNAL objects — the migration
+# for those is DROP+CREATE LOCATION at NEW, so the data must already be at
+# NEW (e.g., via storage-layer azcopy). For drift_managed_on_old, the
+# migration is DEEP CLONE which reads from OLD and writes to NEW as part of
+# the migration step itself; pre-existing data at NEW would be incorrect
+# (the clone target must be empty).
+for r in external_old:
     if not r["storage_path"]:
         continue
     old_p = r["storage_path"]
