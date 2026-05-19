@@ -421,11 +421,16 @@ print("\nCoordinate with pipeline owners to refresh these tables after upstream 
 # MAGIC After validation has succeeded and the grace period has elapsed, drop the
 # MAGIC `*__pre_migration` tables. **Only run this cell after `04_validation`
 # MAGIC reports `overall_pass=True` for every migrated object.**
+# MAGIC
+# MAGIC Flag name intentionally avoids the substring `CONFIRMED = False` so
+# MAGIC driver scripts that do `src.replace("CONFIRMED = False", ...)` to flip
+# MAGIC `CONFIRMED` don't accidentally enable cleanup too (real footgun seen
+# MAGIC during repo testing — silently dropped 119 `__pre_migration` shadows).
 
 # COMMAND ----------
-CLEANUP_CONFIRMED = False  # set True only after validation + grace period
+POST_VALIDATION_CLEANUP_OK = False  # set True only after validation + grace period
 
-if CLEANUP_CONFIRMED:
+if POST_VALIDATION_CLEANUP_OK:
     log_rows = spark.sql(
         f"SELECT pre_migration_fqn FROM {OPS_SCHEMA}.migration_log "
         f"WHERE status = 'validated' AND pre_migration_fqn IS NOT NULL"
@@ -438,4 +443,4 @@ if CLEANUP_CONFIRMED:
         except Exception as e:
             print(f"  FAILED to drop {fqn}: {e}")
 else:
-    print("Cleanup skipped — set CLEANUP_CONFIRMED=True to drop *__pre_migration tables.")
+    print("Cleanup skipped — set POST_VALIDATION_CLEANUP_OK=True to drop *__pre_migration tables.")
