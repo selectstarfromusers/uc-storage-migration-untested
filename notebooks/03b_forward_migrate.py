@@ -110,7 +110,7 @@ fs = dbutils.fs  # noqa: F821
 from utils.migration import rewrite_account_in_path
 
 target_new_path = (
-    rewrite_account_in_path(drift[0]["storage_path"], NEW_STORAGE_ACCOUNT)
+    rewrite_account_in_path(drift[0]["storage_path"], NEW_STORAGE_ACCOUNT, old_account=OLD_STORAGE_ACCOUNT)
     if drift else None
 )
 if target_new_path:
@@ -124,7 +124,7 @@ for r in drift + external_old:
     if not r["storage_path"]:
         continue
     old_p = r["storage_path"]
-    new_p = rewrite_account_in_path(old_p, NEW_STORAGE_ACCOUNT)
+    new_p = rewrite_account_in_path(old_p, NEW_STORAGE_ACCOUNT, old_account=OLD_STORAGE_ACCOUNT)
     if not probe_path_exists(fs=fs, path=new_p):
         missing.append((r["catalog"], r["schema"], r["name"], new_p))
         continue
@@ -239,7 +239,7 @@ for r in external_old:
             mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name,
                            status="snapshot_taken")
 
-        plan = plan_external_table_migration(rec=rec, new_storage_account=NEW_STORAGE_ACCOUNT)
+        plan = plan_external_table_migration(rec=rec, new_storage_account=NEW_STORAGE_ACCOUNT, old_storage_account=OLD_STORAGE_ACCOUNT)
         _execute_steps(rec, plan.steps)
 
         if not DRY_RUN:
@@ -272,7 +272,7 @@ for r in external_old:
         if not DRY_RUN:
             snap_writer.append(catalog=rec.catalog, schema=rec.schema, name=rec.name,
                                object_type="VOLUME", snapshot_json=_serialize_snapshot(snap))
-        plan = plan_external_volume_migration(rec=rec, new_storage_account=NEW_STORAGE_ACCOUNT)
+        plan = plan_external_volume_migration(rec=rec, new_storage_account=NEW_STORAGE_ACCOUNT, old_storage_account=OLD_STORAGE_ACCOUNT)
         _execute_steps(rec, plan.steps)
         if not DRY_RUN:
             replayer.replay(snap, target_fqn=(rec.catalog, rec.schema, rec.name), object_type="VOLUME")

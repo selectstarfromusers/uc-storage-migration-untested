@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Optional
 
-from utils.paths import classify_account, parse_storage_url
+from utils.paths import classify_account, classify_url, parse_storage_url
 
 Classification = Literal[
     "consistent_old",
@@ -44,8 +44,7 @@ def _requires_pipeline_handling(table_type: Optional[str]) -> bool:
 
 
 def _account_class(url: Optional[str], *, old: str, new: str) -> str:
-    parsed = parse_storage_url(url)
-    return classify_account(parsed.account if parsed else None, old=old, new=new)
+    return classify_url(url, old=old, new=new)
 
 
 def classify_object(rec: ObjectRecord, *, old: str, new: str) -> Classification:

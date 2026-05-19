@@ -110,3 +110,46 @@ def classify_account(
     if account_lower == new.lower():
         return "new"
     return "other"
+
+
+def classify_url(url: Optional[str], *, old: str, new: str) -> AccountClass:
+    """Classify a storage URL against OLD/NEW, supporting prefix-as-account mode.
+
+    If OLD or NEW contain a '/', they are interpreted as 'bucket/prefix' (or
+    'account/container/prefix' for abfss). The URL must start with the
+    corresponding prefix to match. Otherwise, falls back to bucket/account
+    comparison only.
+
+    Use case: single-bucket S3 testing where OLD and NEW are different
+    prefixes within the same bucket. Baylor uses true cross-account
+    semantics — pass bare bucket/account names there and behavior is
+    unchanged.
+    """
+    if not url:
+        return "unknown"
+    parsed = parse_storage_url(url)
+    if parsed is None:
+        return "unknown"
+
+    prefix_mode = ("/" in old) or ("/" in new)
+    if not prefix_mode:
+        return classify_account(parsed.account, old=old, new=new)
+
+    # Prefix mode: rebuild a canonical "account/path" string for matching.
+    if isinstance(parsed, S3Path):
+        canon = f"{parsed.account}/{parsed.path}".rstrip("/")
+    elif isinstance(parsed, AdlsPath):
+        # abfss: account/container/path
+        canon = f"{parsed.account}/{parsed.container}/{parsed.path}".rstrip("/")
+    else:
+        return "unknown"
+
+    old_norm = old.lower().rstrip("/")
+    new_norm = new.lower().rstrip("/")
+    canon_lower = canon.lower()
+
+    if canon_lower == old_norm or canon_lower.startswith(old_norm + "/"):
+        return "old"
+    if canon_lower == new_norm or canon_lower.startswith(new_norm + "/"):
+        return "new"
+    return "other"
