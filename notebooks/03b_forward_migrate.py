@@ -88,11 +88,19 @@ assert not (not DRY_RUN and not CONFIRMED), (
 
 inv_df = spark.table(f"{OPS_SCHEMA}.inventory")
 ext_locs_df = spark.table(f"{OPS_SCHEMA}.external_locations")
-ext_locs = [
-    ExternalLocationRecord(name=r["name"], url=r["url"], credential_name=r["credential_name"],
-                           read_only=r["read_only"], region=r.get("region"))
-    for r in ext_locs_df.collect()
-]
+def _row_to_ext_loc(r) -> ExternalLocationRecord:
+    """PySpark Row has no .get(); use asDict() so optional fields don't blow up."""
+    d = r.asDict()
+    return ExternalLocationRecord(
+        name=d["name"], url=d["url"], credential_name=d["credential_name"],
+        read_only=d["read_only"],
+        region=d.get("region"),
+        isolation_mode=d.get("isolation_mode"),
+        accessible_in_current_workspace=d.get("accessible_in_current_workspace"),
+    )
+
+
+ext_locs = [_row_to_ext_loc(r) for r in ext_locs_df.collect()]
 inv_rows = inv_df.collect()
 
 drift = [r for r in inv_rows if r["classification"] == "drift_managed_on_old"]

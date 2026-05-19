@@ -50,6 +50,24 @@ def test_parse_show_grants_rows():
     ]
 
 
+def test_parse_show_grants_rows_handles_uc_capitalized_columns():
+    """UC's SHOW GRANTS returns 'Principal', 'ActionType', 'ObjectType' — not lowercase."""
+    rows = [
+        {"Principal": "alice@x.com", "ActionType": "SELECT", "ObjectType": "TABLE", "ObjectKey": "c.s.t"},
+        {"Principal": "bob@x.com", "ActionType": "ALL PRIVILEGES", "ObjectType": "CATALOG", "ObjectKey": "c"},
+    ]
+    result = parse_show_grants_rows(rows)
+    assert result == [
+        GrantEntry(principal="alice@x.com", privilege="SELECT", object_type="TABLE"),
+        GrantEntry(principal="bob@x.com", privilege="ALL PRIVILEGES", object_type="CATALOG"),
+    ]
+
+
+def test_parse_show_grants_rows_skips_rows_with_no_principal():
+    rows = [{"ActionType": "SELECT"}]  # malformed — no principal
+    assert parse_show_grants_rows(rows) == []
+
+
 def test_parse_show_tags_rows():
     rows = [
         {"tag_name": "owner_team", "tag_value": "platform"},

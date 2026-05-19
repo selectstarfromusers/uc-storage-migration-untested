@@ -70,14 +70,24 @@ def build_show_row_filter_sql(*, catalog: str, schema: str, name: str) -> str:
 # --- Parsers for capture output ---
 
 def parse_show_grants_rows(rows: list[dict]) -> list[GrantEntry]:
-    return [
-        GrantEntry(
-            principal=r["principal"],
-            privilege=r.get("action_type") or r.get("privilege") or r.get("action"),
-            object_type=r.get("object_type", "TABLE"),
+    """Parse SHOW GRANTS output. Case-insensitive — UC returns 'Principal',
+    'ActionType', 'ObjectType' (capitalized); older docs show lowercase."""
+    out: list[GrantEntry] = []
+    for r in rows:
+        norm = {k.lower().replace("_", ""): v for k, v in r.items()}
+        principal = norm.get("principal")
+        if not principal:
+            continue
+        privilege = (
+            norm.get("actiontype") or norm.get("privilege") or norm.get("action")
         )
-        for r in rows
-    ]
+        object_type = norm.get("objecttype") or "TABLE"
+        out.append(GrantEntry(
+            principal=principal,
+            privilege=privilege,
+            object_type=object_type,
+        ))
+    return out
 
 
 def parse_show_tags_rows(rows: list[dict]) -> list[TagEntry]:

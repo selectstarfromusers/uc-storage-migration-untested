@@ -63,22 +63,25 @@ import json
 from utils.discovery import ObjectRecord, classify_object
 from utils.governance import GovernanceCapturer
 from utils.migration import rewrite_account_in_path
-from utils.paths import classify_account, parse_storage_url
+from utils.paths import classify_url, parse_storage_url
 from utils.reporting import DecisionThresholds, compute_recommendation
 from utils.sql import quote_fqn
 from utils.state import MigrationLog, SnapshotWriter
 
 
-def _account_of(url):
-    p = parse_storage_url(url)
-    return p.account if p else None
-
-
 def _is_on(url, account):
-    return classify_account(_account_of(url), old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT) == (
-        "old" if account == OLD_STORAGE_ACCOUNT else
-        "new" if account == NEW_STORAGE_ACCOUNT else None
-    )
+    """True if `url` belongs to the OLD or NEW account/prefix.
+
+    Uses classify_url so prefix-mode (S3 single-bucket testing) works.
+    A bare classify_account would fail in prefix mode because the URL's
+    bucket portion alone doesn't equal 'bucket/prefix'.
+    """
+    cls = classify_url(url, old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT)
+    if account == OLD_STORAGE_ACCOUNT:
+        return cls == "old"
+    if account == NEW_STORAGE_ACCOUNT:
+        return cls == "new"
+    return False
 
 assert not (not DRY_RUN and not CONFIRMED), (
     "DRY_RUN=False requires CONFIRMED=True. Set both flags explicitly."

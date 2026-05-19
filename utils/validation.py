@@ -6,7 +6,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
-from utils.paths import parse_storage_url
+from utils.paths import classify_url, parse_storage_url
+
+
+def _is_on_account(url: Optional[str], expected_account: str) -> bool:
+    """True iff `url` belongs to `expected_account`.
+
+    Handles both bucket/account-name mode (`expected_account` is a bare
+    name like "oldacct" or "mybucket") and prefix mode (`expected_account`
+    contains a slash, e.g. "mybucket/migration-test-new"). The latter is
+    used for AWS single-bucket testing where OLD/NEW are prefixes, not
+    distinct buckets.
+    """
+    if not url:
+        return False
+    if "/" in expected_account:
+        return classify_url(url, old="__unused__", new=expected_account) == "new"
+    parsed = parse_storage_url(url)
+    return parsed is not None and parsed.account == expected_account
 from utils.sql import quote_fqn, parse_describe_extended_location
 
 
@@ -42,6 +59,11 @@ class _Fs(Protocol):
 
 
 def _hosts_in_paths(paths: list[str]) -> set[str]:
+    """Extract bucket/account hosts from a list of storage URLs.
+
+    Returns the canonical bucket/account names — callers in prefix-mode
+    must compare using _is_on_account, not direct equality.
+    """
     out: set[str] = set()
     for p in paths:
         parsed = parse_storage_url(p)
@@ -90,15 +112,19 @@ def validate_object_on_new(
         )
         location = parse_describe_extended_location(rendered)
         evidence["describe_location"] = location
-        parsed = parse_storage_url(location) if location else None
-        metadata_ok = parsed is not None and parsed.account == expected_new_account
+        metadata_ok = _is_on_account(location, expected_new_account)
     except Exception as e:
         metadata_ok = False
         evidence["describe_location_error"] = str(e)
 
-    # --- Layer 2: _delta_log at new path (Delta only) ---
+    # --- Layer 2: _delta_log at new path (Delta only, external tables only) ---
+    # For managed tables, UC blocks direct dbutils.fs.ls on __unitystorage paths
+    # with "overlaps with managed storage". For managed tables the DESCRIBE
+    # EXTENDED location (Layer 1) IS the Delta log location, so Layer 2 adds
+    # no signal — mark N/A. For external tables, the vended-creds layer permits
+    # ls and we can confirm _delta_log/ exists.
     delta_log_ok: Optional[bool]
-    if is_delta and evidence.get("describe_location"):
+    if is_delta and evidence.get("describe_location") and is_external:
         try:
             entries = fs.ls(f"{evidence['describe_location'].rstrip('/')}/_delta_log") or []
             delta_log_ok = bool(entries)
@@ -108,15 +134,22 @@ def validate_object_on_new(
             evidence["delta_log_error"] = str(e)
     else:
         delta_log_ok = None
+        if is_delta and not is_external:
+            evidence["delta_log_skipped"] = (
+                "managed Delta — UC blocks direct __unitystorage ls. "
+                "Layer 1 already proves location."
+            )
 
-    # --- Layer 3: input_file_name() at runtime ---
+    # --- Layer 3: file path via _metadata.file_path ---
+    # input_file_name() is rejected in Unity Catalog with
+    # UC_COMMAND_NOT_SUPPORTED; the supported path is _metadata.file_path.
     # Empty-table case: no rows means no file paths, but that does NOT prove
     # reads from old. Mark as None and exclude from overall_pass so empty
     # tables can still pass when other layers agree.
     input_ok: Optional[bool]
     try:
         rows = spark.sql(
-            f"SELECT input_file_name() AS path FROM {fqn} LIMIT {sample_limit}"
+            f"SELECT _metadata.file_path AS path FROM {fqn} LIMIT {sample_limit}"
         ).collect()
         paths = _parse_input_file_name_rows(rows)
         hosts = _hosts_in_paths(paths)
@@ -126,7 +159,8 @@ def validate_object_on_new(
             input_ok = None
             evidence["input_file_name_empty"] = True
         else:
-            input_ok = hosts == {expected_new_account}
+            # Every sampled path must be on expected_new_account.
+            input_ok = bool(paths) and all(_is_on_account(p, expected_new_account) for p in paths)
     except Exception as e:
         input_ok = False
         evidence["input_file_name_error"] = str(e)
@@ -140,8 +174,8 @@ def validate_object_on_new(
         parent_ok = None
         evidence["parent_layer_skipped"] = "external object — Layer 4 N/A"
     elif parent_managed_location:
+        parent_ok = _is_on_account(parent_managed_location, expected_new_account)
         parent_parsed = parse_storage_url(parent_managed_location)
-        parent_ok = parent_parsed is not None and parent_parsed.account == expected_new_account
         evidence["parent_account"] = parent_parsed.account if parent_parsed else None
     else:
         parent_ok = False
