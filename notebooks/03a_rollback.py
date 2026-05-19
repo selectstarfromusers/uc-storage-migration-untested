@@ -277,16 +277,23 @@ for r in rows:
         schemas_to_revert.append((r["catalog"], r["schema"], old_path))
 
 print(f"Schemas to revert: {len(schemas_to_revert)}")
+
+# Use REST PATCH instead of SQL ALTER SCHEMA SET MANAGED LOCATION — the
+# latter is rejected on native UC catalogs. See utils/uc_admin.py.
+from utils.uc_admin import set_schema_storage_root
+from databricks.sdk import WorkspaceClient
+_rollback_w = WorkspaceClient()
+
 for catalog, sch, old_path in schemas_to_revert:
-    sql = (
-        f"ALTER SCHEMA {quote_fqn(catalog, sch)} "
-        f"SET MANAGED LOCATION '{old_path}'"
-    )
     if DRY_RUN:
-        print(f"  DRY: {sql}")
+        print(f"  DRY: PATCH /api/2.1/unity-catalog/schemas/{catalog}.{sch} "
+              f"storage_root='{old_path}'")
     else:
         try:
-            spark.sql(sql)
+            set_schema_storage_root(
+                api_client=_rollback_w.api_client,
+                catalog=catalog, schema=sch, storage_root=old_path,
+            )
             print(f"  reverted: {catalog}.{sch}")
         except Exception as e:
             print(f"  FAILED schema revert {catalog}.{sch}: {e}")
@@ -297,6 +304,7 @@ for catalog, sch, old_path in schemas_to_revert:
 
 # COMMAND ----------
 from utils.uc_client import UcClient
+from utils.uc_admin import set_catalog_storage_root
 from databricks.sdk import WorkspaceClient
 
 
@@ -316,12 +324,15 @@ for c in catalogs:
     parsed = parse_storage_url(c.storage_root)
     if parsed and parsed.account == NEW_STORAGE_ACCOUNT:
         old_path = rewrite_account_in_path(c.storage_root, OLD_STORAGE_ACCOUNT)
-        sql = f"ALTER CATALOG {quote_fqn(c.name)} SET MANAGED LOCATION '{old_path}'"
         if DRY_RUN:
-            print(f"  DRY: {sql}")
+            print(f"  DRY: PATCH /api/2.1/unity-catalog/catalogs/{c.name} "
+                  f"storage_root='{old_path}'")
         else:
             try:
-                spark.sql(sql)
+                set_catalog_storage_root(
+                    api_client=w.api_client,
+                    catalog=c.name, storage_root=old_path,
+                )
                 print(f"  reverted catalog {c.name}")
             except Exception as e:
                 print(f"  FAILED catalog revert {c.name}: {e}")
