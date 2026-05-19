@@ -27,11 +27,34 @@ modules. On Databricks, pyspark is preinstalled.
 ## Run (customer workspace)
 
 1. Upload `utils/` and `notebooks/` to the workspace, side by side.
-2. Run notebooks in order: `01_discovery` → `02_decision_report` →
+2. **For native UC managed catalogs** (i.e. NOT HMS-federated), run
+   `00_repoint_schemas` first. SQL `ALTER SCHEMA SET MANAGED LOCATION`
+   is blocked on native UC; this notebook does the equivalent via UC
+   REST PATCH and sets up the drift that `01_discovery` then sees.
+3. Run notebooks in order: `01_discovery` → `02_decision_report` →
    either `03a_rollback` or `03b_forward_migrate` → `04_validation`.
-3. Each notebook has a config cell. Defaults are `DRY_RUN=True` for the
+4. Each notebook has a config cell. Defaults are `DRY_RUN=True` for the
    mutating notebooks. Set `CONFIRMED=True` and `DRY_RUN=False` only after
    reviewing the planned operations.
+
+### What the migration actually moves
+
+- **Managed Delta tables** (`drift_managed_on_old` classification) —
+  `DEEP CLONE` physically reads from OLD and writes fresh files at NEW
+  via the schema's repointed `storage_root`. The repo owns the data
+  movement end-to-end. No dependency on any prior storage-layer copy.
+- **External tables** (`external_on_old`) — `DROP TABLE` + `CREATE
+  EXTERNAL TABLE` at the new path. The repo does NOT copy external-table
+  data; pre-flight requires the data to already be at NEW (e.g., via
+  storage-layer azcopy/rsync). If a prior storage-layer copy is suspect,
+  either redo it for these objects, convert them to managed first, or
+  exclude them.
+- **Managed volumes** — currently deferred (Plan 2.1). Flagged in the
+  discovery output for manual handling.
+- **Materialized Views / Streaming Tables** — flagged as
+  `requires_pipeline_handling`. The repo migrates their backing
+  `__materialization_mat_*` Delta tables, but the MV definitions
+  themselves need a pipeline-owner `REFRESH` after migration.
 
 ## Layout
 
