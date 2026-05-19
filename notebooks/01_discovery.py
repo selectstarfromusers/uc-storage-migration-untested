@@ -119,8 +119,9 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {OPS_SCHEMA}")
 # MAGIC ## Step 1 — Metastore + external locations
 
 # COMMAND ----------
-assignment = w.metastores.current()
-metastore = w.metastores.get(assignment.metastore_id)
+# summary() works for any user with USE METASTORE; .get() requires metastore admin
+# (most customer SAs aren't admins — use summary() to keep discovery accessible).
+metastore = w.metastores.summary()
 print(f"Metastore: {metastore.name} ({metastore.metastore_id})")
 print(f"  storage_root: {metastore.storage_root}")
 print(f"  region: {metastore.region}")
