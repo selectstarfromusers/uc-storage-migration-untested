@@ -260,20 +260,23 @@ VOLUME_SIZE_MAX_FILES = 10000          # cap files walked per volume
 VOLUME_SIZE_MAX_SECONDS_PER_VOLUME = 30  # cap wall time per volume
 
 
-def _collect_volume_size(path: str | None, fqn_display: str) -> int | None:
-    """Recursively sum file sizes under a volume's storage path via dbutils.fs.
+def _collect_volume_size(
+    catalog: str, schema: str, name: str, fqn_display: str,
+) -> int | None:
+    """Recursively sum file sizes under a volume by walking `/Volumes/{cat}/{sch}/{vol}/`.
 
-    Returns None on any failure (path missing, permission, timeout). Logs to
-    `_size_skipped` so the reason is visible in the summary at the end.
+    Uses the UC-friendly /Volumes/... path, not the raw s3:// storage_path —
+    dbutils.fs.ls on the raw __unitystorage S3 path doesn't work even though
+    UC owns the credential. The /Volumes/ path goes through UC's vended-creds
+    layer and lists correctly for any user with READ VOLUME.
 
     Bounded by VOLUME_SIZE_MAX_FILES and VOLUME_SIZE_MAX_SECONDS_PER_VOLUME so
-    a pathological volume can't stall discovery.
+    a pathological volume can't stall discovery. Failures logged to
+    `_size_skipped` for visibility at the end of the run.
     """
     if not COLLECT_SIZES:
         return None
-    if not path:
-        _size_skipped.append((fqn_display, "(volume)", "no storage_path"))
-        return None
+    path = f"/Volumes/{catalog}/{schema}/{name}/"
     import time
     deadline = time.monotonic() + VOLUME_SIZE_MAX_SECONDS_PER_VOLUME
     total = 0
@@ -326,7 +329,17 @@ def _collect_size(catalog: str, schema: str, name: str, fmt: str | None,
         return None
     fmt_upper = (fmt or "").upper()
     fqn_display = f"{catalog}.{schema}.{name}"
-    delta_capable_table_types = {"MANAGED", "EXTERNAL", "MATERIALIZED_VIEW", "STREAMING_TABLE"}
+    # MVs and STs are treated as views by DESCRIBE DETAIL (it errors with
+    # EXPECT_TABLE_NOT_VIEW). Their sizes are not directly queryable; the
+    # backing __materialization_mat_* tables (already in inventory as MANAGED
+    # Delta) carry the real bytes. Skip MV/ST cleanly with a clear reason.
+    if table_type in {"MATERIALIZED_VIEW", "STREAMING_TABLE"}:
+        _size_skipped.append((
+            fqn_display, fmt or "(null)",
+            f"{table_type}: DESCRIBE DETAIL not supported; size is in backing __materialization_* table",
+        ))
+        return None
+    delta_capable_table_types = {"MANAGED", "EXTERNAL"}
     is_delta_compat_fmt = (not fmt_upper) or fmt_upper == "DELTA"
     is_delta_compat_type = table_type in delta_capable_table_types
     # Skip only when both fmt and table_type say this is definitely not Delta-capable.
@@ -405,7 +418,7 @@ for _, row in volumes_df.iterrows():
         created_at=row.get("created"),
         last_altered=row.get("last_altered"),
         requires_pipeline_handling=False,
-        size_bytes=_collect_volume_size(storage_path, vol_fqn),
+        size_bytes=_collect_volume_size(cat, sch, nm, vol_fqn),
         tag_count=None,
         grant_count=None,
         has_row_filter=None,
