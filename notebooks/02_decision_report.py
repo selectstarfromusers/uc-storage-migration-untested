@@ -50,18 +50,14 @@ else:
 # MAGIC ## Config
 
 # COMMAND ----------
-OPS_SCHEMA = "main._migration_ops"
-# Thresholds tunable here without re-running discovery
-THRESHOLDS = {
-    "max_consistent_new_objects": 25,
-    "max_bytes_on_new_gb": 10.0,
-    "max_distinct_owners_on_new": 3,
-    "max_age_days_on_new": 30,
-}
-# Rule-of-thumb for cost/time estimate
-ADLS_CLONE_GBPS_SAME_REGION = 0.5    # GB/sec, conservative same-region estimate
-ADLS_CLONE_GBPS_CROSS_REGION = 0.15  # GB/sec, conservative cross-region estimate
-DBU_PER_HOUR = 1.5                   # cluster DBU rate (single all-purpose cluster baseline)
+# All values come from utils/config.py — edit there, not here.
+from utils.config import (
+    OPS_SCHEMA,
+    THRESHOLDS,
+    ADLS_CLONE_GBPS_SAME_REGION,
+    ADLS_CLONE_GBPS_CROSS_REGION,
+    DBU_PER_HOUR,
+)
 
 # COMMAND ----------
 # MAGIC %md

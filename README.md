@@ -27,15 +27,22 @@ modules. On Databricks, pyspark is preinstalled.
 ## Run (customer workspace)
 
 1. Upload `utils/` and `notebooks/` to the workspace, side by side.
-2. **For native UC managed catalogs** (i.e. NOT HMS-federated), run
+2. **Edit `utils/config.py` once.** It is the single source of truth
+   for identity values: `OLD_STORAGE_ACCOUNT`, `NEW_STORAGE_ACCOUNT`,
+   `OPS_SCHEMA`, `CATALOG_ALLOWLIST`, thresholds, and tunables. Every
+   notebook imports from here. Operational gates (`CONFIRMED`,
+   `DRY_RUN`, `ACTOR`, `POST_VALIDATION_CLEANUP_OK`) deliberately stay
+   per-notebook so a single edit can't arm destructive ops across the
+   whole pipeline.
+3. **For native UC managed catalogs** (i.e. NOT HMS-federated), run
    `00_repoint_schemas` first. SQL `ALTER SCHEMA SET MANAGED LOCATION`
    is blocked on native UC; this notebook does the equivalent via UC
    REST PATCH and sets up the drift that `01_discovery` then sees.
-3. Run notebooks in order: `01_discovery` → `02_decision_report` →
+4. Run notebooks in order: `01_discovery` → `02_decision_report` →
    either `03a_rollback` or `03b_forward_migrate` → `04_validation`.
-4. Each notebook has a config cell. Defaults are `DRY_RUN=True` for the
-   mutating notebooks. Set `CONFIRMED=True` and `DRY_RUN=False` only after
-   reviewing the planned operations.
+5. Defaults are `DRY_RUN=True` for the mutating notebooks. Set
+   `CONFIRMED=True` and `DRY_RUN=False` only after reviewing the planned
+   operations.
 
 ### What the migration actually moves
 

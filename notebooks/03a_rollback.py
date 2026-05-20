@@ -50,9 +50,15 @@ else:
 # MAGIC ## Config
 
 # COMMAND ----------
-OLD_STORAGE_ACCOUNT = "oldacct"
-NEW_STORAGE_ACCOUNT = "newacct"
-OPS_SCHEMA = "main._migration_ops"
+# Identity values come from utils/config.py — edit there, not here.
+from utils.config import (
+    OLD_STORAGE_ACCOUNT,
+    NEW_STORAGE_ACCOUNT,
+    OPS_SCHEMA,
+)
+
+# Per-run operational gates — stay in this notebook so a single edit to
+# utils/config.py can't arm destructive ops across multiple notebooks.
 CONFIRMED = False                # MUST be set to True to execute
 DRY_RUN = True                   # set to False to actually execute (only after CONFIRMED=True)
 ACTOR = "rollback_runner"        # identifier for migration_log claim_by

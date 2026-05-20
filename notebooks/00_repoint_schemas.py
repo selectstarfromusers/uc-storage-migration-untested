@@ -55,14 +55,15 @@ else:
 # MAGIC ## Config
 
 # COMMAND ----------
-CATALOG = "your_catalog"           # e.g. "artm_dev_catalog"
-# Schemas to repoint. Skip system schemas (information_schema) and any
-# schema you don't want to migrate (typically the one used for migration
-# operations / logging, if any).
-SCHEMAS_TO_REPOINT: list[str] = []  # e.g. ["bronze", "silver", "gold"]
-# NEW prefix — each schema's storage_root will be set to
-# f"{NEW_STORAGE_PREFIX}/{schema}".
-NEW_STORAGE_PREFIX = "abfss://container@newacct.dfs.core.windows.net/path"
+# Identity values come from utils/config.py — edit there, not here.
+from utils.config import (
+    REPOINT_CATALOG as CATALOG,
+    SCHEMAS_TO_REPOINT,
+    NEW_STORAGE_PREFIX,
+)
+
+# Per-run operational gate — stays in this notebook so a single edit to
+# utils/config.py can't arm a destructive op across multiple notebooks.
 CONFIRMED = False                   # set True to actually repoint
 
 # COMMAND ----------

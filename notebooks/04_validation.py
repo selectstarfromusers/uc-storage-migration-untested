@@ -46,9 +46,12 @@ else:
 # MAGIC ## Config
 
 # COMMAND ----------
-NEW_STORAGE_ACCOUNT = "newacct"
-OPS_SCHEMA = "main._migration_ops"
-SAMPLE_LIMIT = 10000
+# All values come from utils/config.py — edit there, not here.
+from utils.config import (
+    NEW_STORAGE_ACCOUNT,
+    OPS_SCHEMA,
+    SAMPLE_LIMIT,
+)
 
 # COMMAND ----------
 # MAGIC %md

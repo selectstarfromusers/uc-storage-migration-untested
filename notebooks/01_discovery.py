@@ -72,12 +72,15 @@ else:
 # MAGIC ## Config
 
 # COMMAND ----------
-OLD_STORAGE_ACCOUNT = "oldacct"
-NEW_STORAGE_ACCOUNT = "newacct"
-CATALOG_ALLOWLIST: list[str] = []        # empty = all catalogs in metastore
-OPS_SCHEMA = "main._migration_ops"
-COLLECT_SIZES = True                     # populate size_bytes via DESCRIBE DETAIL for Delta tables
-LINEAGE_LOOKBACK_DAYS = 30
+# All values come from utils/config.py — edit there, not here.
+from utils.config import (
+    OLD_STORAGE_ACCOUNT,
+    NEW_STORAGE_ACCOUNT,
+    CATALOG_ALLOWLIST,
+    OPS_SCHEMA,
+    COLLECT_SIZES,
+    LINEAGE_LOOKBACK_DAYS,
+)
 
 # COMMAND ----------
 # MAGIC %md
