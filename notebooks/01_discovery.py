@@ -239,6 +239,60 @@ grant_counts = _count_per_fqn(
 )
 print(f"Tables with grants: {len(grant_counts)}")
 
+# Registered models — surfaced as inventory rows with classification
+# 'requires_external_handling'. The repo doesn't migrate them (they're
+# catalog-scoped metadata; their physical model files follow UC's own
+# rules), but the customer needs to see them.
+models_where = where_clause.replace("table_catalog", "catalog_name")
+try:
+    models_df = spark.sql(f"""
+SELECT
+  catalog_name AS table_catalog,
+  schema_name AS table_schema,
+  model_name AS table_name,
+  'REGISTERED_MODEL' AS table_type,
+  NULL AS data_source_format,
+  model_owner AS owner,
+  created, last_altered,
+  NULL AS storage_path
+FROM system.information_schema.models
+{models_where}
+""").toPandas()
+    print(f"Registered models: {len(models_df)}")
+except Exception as e:
+    print(f"  (skipped models — system.information_schema.models unavailable: {e})")
+    import pandas as pd
+    models_df = pd.DataFrame(columns=[
+        "table_catalog","table_schema","table_name","table_type",
+        "data_source_format","owner","created","last_altered","storage_path"
+    ])
+
+# Functions / UDFs — same treatment. UC stores their definitions in the
+# catalog; they follow whatever catalog they live in.
+routines_where = where_clause.replace("table_catalog", "routine_catalog")
+try:
+    functions_df = spark.sql(f"""
+SELECT
+  routine_catalog AS table_catalog,
+  routine_schema AS table_schema,
+  routine_name AS table_name,
+  'FUNCTION' AS table_type,
+  NULL AS data_source_format,
+  routine_owner AS owner,
+  created, last_altered,
+  NULL AS storage_path
+FROM system.information_schema.routines
+{routines_where}
+""").toPandas()
+    print(f"Functions / UDFs: {len(functions_df)}")
+except Exception as e:
+    print(f"  (skipped functions — system.information_schema.routines unavailable: {e})")
+    import pandas as pd
+    functions_df = pd.DataFrame(columns=[
+        "table_catalog","table_schema","table_name","table_type",
+        "data_source_format","owner","created","last_altered","storage_path"
+    ])
+
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## Step 4 — Build ObjectRecords and classify
@@ -430,6 +484,38 @@ for _, row in volumes_df.iterrows():
     )
     cls = classify_object(rec, old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT)
     records.append((rec, cls))
+
+# Registered models — classify_object routes them to requires_external_handling.
+for _, row in models_df.iterrows():
+    cat, sch, nm = row["table_catalog"], row["table_schema"], row["table_name"]
+    rec = ObjectRecord(
+        catalog=cat, schema=sch, name=nm,
+        object_type="REGISTERED_MODEL",
+        table_type=None, data_source_format=None,
+        storage_path=None, parent_managed_location=parent_managed_location(cat, sch),
+        owner=row.get("owner"),
+        created_at=row.get("created"), last_altered=row.get("last_altered"),
+        requires_pipeline_handling=False,
+        size_bytes=None, tag_count=None, grant_count=None,
+        has_row_filter=None, has_column_mask=None,
+    )
+    records.append((rec, classify_object(rec, old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT)))
+
+# Functions / UDFs — same.
+for _, row in functions_df.iterrows():
+    cat, sch, nm = row["table_catalog"], row["table_schema"], row["table_name"]
+    rec = ObjectRecord(
+        catalog=cat, schema=sch, name=nm,
+        object_type="FUNCTION",
+        table_type=None, data_source_format=None,
+        storage_path=None, parent_managed_location=parent_managed_location(cat, sch),
+        owner=row.get("owner"),
+        created_at=row.get("created"), last_altered=row.get("last_altered"),
+        requires_pipeline_handling=False,
+        size_bytes=None, tag_count=None, grant_count=None,
+        has_row_filter=None, has_column_mask=None,
+    )
+    records.append((rec, classify_object(rec, old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT)))
 
 print(f"Classified {len(records)} objects")
 print(f"DESCRIBE EXTENDED fallback resolved {_fallback_count} objects that had null info_schema.storage_path")

@@ -15,6 +15,7 @@ Classification = Literal[
     "external_on_new",
     "unknown_account",
     "path_missing",
+    "requires_external_handling",  # registered models, functions — not migrated by repo
 ]
 
 
@@ -49,6 +50,12 @@ def _account_class(url: Optional[str], *, old: str, new: str) -> str:
 
 def classify_object(rec: ObjectRecord, *, old: str, new: str) -> Classification:
     """Classify an object based on its storage path vs its parent's managed location."""
+    # Registered models and functions are catalog-scoped UC metadata; the repo
+    # cannot migrate them by repointing storage_root. Flag them for manual
+    # handling so the customer at least sees them in the inventory.
+    if rec.object_type in {"REGISTERED_MODEL", "FUNCTION"}:
+        return "requires_external_handling"
+
     # Views and anything without a storage path → path_missing
     if rec.storage_path is None or rec.table_type in {"VIEW"}:
         return "path_missing"
