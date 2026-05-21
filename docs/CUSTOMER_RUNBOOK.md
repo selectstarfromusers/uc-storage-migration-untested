@@ -52,9 +52,20 @@ These materially change the workflow. Answer them up front.
    with the pipeline owners before running `03b_forward_migrate`.
 
 4. **Do you have managed volumes in scope?** Currently deferred (Plan
-   2.1). The discovery output flags them; handling is manual:
-   `dbutils.fs.cp(old_path, new_path, recurse=True)` → `DROP VOLUME` →
-   `CREATE MANAGED VOLUME` → replay grants.
+   2.1). `03b_forward_migrate` **refuses to start** if any managed
+   volumes are in drift, unless you set
+   `ALLOW_MANAGED_VOLUMES_SKIP = True` in `utils/config.py`. With
+   that flag set, 03b proceeds with table-only migration and the
+   listed managed volumes are skipped. Manual handling: `dbutils.fs.cp`
+   → `DROP VOLUME` → `CREATE MANAGED VOLUME` → replay grants.
+
+5. **Do you have registered models or functions in scope?** `01_discovery`
+   now enumerates them from `system.information_schema.models` and
+   `.routines` and classifies them as `requires_external_handling`. The
+   repo does not migrate them — they're catalog-scoped UC metadata that
+   follows the catalog wherever it goes. They're surfaced in the
+   inventory + decision report so you see them; no action is needed
+   from the migration itself.
 
 ---
 
@@ -65,20 +76,27 @@ These materially change the workflow. Answer them up front.
    side-by-side under a workspace folder you own.
 
 2. **Edit `utils/config.py`.** This is the single source of truth.
-   Most-edited values:
+   The notebooks call `resolve_config(spark=spark)` at startup, which
+   fills in smart defaults you didn't set.
+
+   Values you must set explicitly:
    - `OLD_STORAGE_ACCOUNT`, `NEW_STORAGE_ACCOUNT` — bare account/bucket
      names. For Azure this is the storage-account portion of the
      `abfss://` host. For AWS this is the bare bucket name.
-   - `OPS_SCHEMA` — where the audit + state tables live, e.g.
-     `<your_catalog>._migration_ops`. You need CREATE SCHEMA on the
-     catalog. Pick something you own and that won't conflict with
-     existing schemas.
    - `CATALOG_ALLOWLIST` — narrow down to the catalogs you actually
-     want to migrate. Empty list = all catalogs in the metastore (NOT
-     what you want for a production run).
-   - `REPOINT_CATALOG`, `SCHEMAS_TO_REPOINT`, `NEW_STORAGE_PREFIX` —
-     only relevant for the native-UC setup step. `NEW_STORAGE_PREFIX`
-     is the parent under which each schema gets its own subdirectory.
+     want to migrate. **Empty list is refused** unless you also set
+     `ALLOW_ALL_CATALOGS=True` (rarely correct for a production run).
+   - `NEW_STORAGE_PREFIX` (for `00_repoint_schemas` only) — the full
+     URL prefix where each schema's storage_root will be set, e.g.
+     `s3://newbucket/migration/your_catalog` or
+     `abfss://container@newacct.dfs.core.windows.net/migration/your_catalog`.
+
+   Auto-derived defaults (leave as `None` to opt in):
+   - `OPS_SCHEMA` → `f"{CATALOG_ALLOWLIST[0]}._migration_ops"`
+   - `REPOINT_CATALOG` → `CATALOG_ALLOWLIST[0]` when there's exactly one
+   - `SCHEMAS_TO_REPOINT` → all user-owned schemas in `REPOINT_CATALOG`,
+     excluding `information_schema`, `default`, schemas starting with
+     `_`, and the schema portion of `OPS_SCHEMA` if it lives there.
 
 3. **Identify a compute target.** Serverless SQL warehouse works for
    most steps; the volume-size walker in `01_discovery` and the
@@ -283,40 +301,53 @@ flags, evidence JSON, timestamp.
 
 ---
 
-## 7. Cleanup (gated)
+## 7. Cleanup — separate notebook `05_cleanup`
 
-After validation passes for every object and you've held the grace
-period you want:
+After `04_validation` passes for every object and you've held the
+grace period you want, cleanup runs as a standalone step:
 
-1. Open `notebooks/03b_forward_migrate`
-2. Set `POST_VALIDATION_CLEANUP_OK = True` (last cell)
-3. Re-run only Step 8
+1. Open `notebooks/05_cleanup`
+2. In `utils/config.py`, set `POST_VALIDATION_CLEANUP_OK = True`
+3. In the notebook, set `DRY_RUN = False`
+4. Run
 
-This drops every `*__pre_migration` table listed in `migration_log`
-where `status='validated'`. Storage-layer files at OLD become orphans —
-you delete them via the storage console, or by repointing the IAM role
-to deny access first (recommended) so any forgotten readers fail
-visibly.
+Both gates must be set; either alone produces a plan-only preview.
+The notebook drops every `__pre_migration` table listed in
+`migration_log` with `status='validated'` and writes an audit row to
+`<OPS_SCHEMA>.cleanup_log` per drop.
 
-The flag is named `POST_VALIDATION_CLEANUP_OK` (not `CLEANUP_CONFIRMED`)
-specifically to avoid being matched by automation scripts that flip
-`CONFIRMED = False` to `True` via substring replacement.
+**Cleanup is irreversible.** Once shadows are dropped, `03a_rollback`
+can no longer restore the original state. The notebook prints a
+warning before any drops execute.
+
+Storage-layer files at OLD become orphans — delete them via the
+storage console, or repoint the IAM role to deny access first
+(recommended) so any forgotten readers fail visibly.
 
 ---
 
-## 8. Rollback (only if validation fails)
+## 8. Rollback — `03a_rollback` is now a true inverse of `03b`
 
-`notebooks/03a_rollback`. Only run if `02_decision_report` recommends
-`ROLLBACK_*`. Procedure:
+If you need to undo `03b_forward_migrate` (before running `05_cleanup`):
 
-1. Pre-flight: recompute the recommendation against current inventory.
-   Refuses to run if verdict is `FORWARD_MIGRATE_REQUIRED`.
-2. Probe RW access to OLD + NEW representative paths.
-3. Capture governance snapshots for every `consistent_new` object.
-4. Drop every `consistent_new` object.
-5. Revert each schema's `storage_root` to OLD via REST PATCH (was
-   formerly SQL ALTER SCHEMA — switched because of native UC block).
-6. Revert each catalog's `storage_root` to OLD via REST PATCH.
+`notebooks/03a_rollback` reads `migration_log` to know exactly what
+`03b` did, then inverts it:
+
+| 03b did | 03a does |
+|---|---|
+| Managed Delta DEEP CLONE + RENAME swap | DROP migrated, RENAME `__pre_migration` shadow back to original FQN |
+| Managed non-Delta CTAS + RENAME swap | Same as above |
+| External table DROP + CREATE at new path | DROP migrated, CREATE EXTERNAL TABLE at the original `storage_path` from inventory |
+| External volume DROP + CREATE at new path | Same as above (VOLUME variant) |
+
+After per-object rollback, schema and catalog `storage_root` are
+reverted to OLD via REST PATCH.
+
+**Hard pre-condition**: every `__pre_migration` shadow recorded in
+`migration_log` must still exist. If `05_cleanup` has already dropped
+any of them, the notebook raises `RuntimeError` and refuses to start.
+At that point rollback is impossible from this repo — restore from an
+external backup or re-migrate from a known-good source.
 
 After running, re-run `01_discovery` to verify everything is back to
 `consistent_old`.
@@ -329,12 +360,13 @@ Everything the repo runs writes to `<ops_schema>`:
 
 | Table | What |
 |---|---|
-| `inventory` | Discovery output — every UC object with classification |
+| `inventory` | Discovery output — every UC object with classification (incl. REGISTERED_MODEL + FUNCTION as `requires_external_handling`) |
 | `external_locations` | EL snapshot (incl. isolation_mode, accessible_in_current_workspace) |
 | `lineage_consumers` | Downstream consumers (if system.access enabled) |
-| `migration_log` | One row per object the migration touched: status, FQN, row counts, schema hashes, claim_by, error traces |
+| `migration_log` | One row per object the migration touched: status, FQN, row counts, schema hashes, claim_by, error traces. `status='rolled_back'` after `03a_rollback`. |
 | `object_metadata_snapshot` | Grants/owner/tags/filters/comments captured before each migration — used by `GovernanceReplayer` |
 | `validation_results` | Per-object 4-layer evidence + overall_pass |
+| `cleanup_log` | Created by `05_cleanup`. One row per dropped `__pre_migration` shadow (ts, fqn, status, error_message). |
 
 For your own custom logging (test runs, evidence beyond the repo's
 defaults), you can create your own schema with a VARIANT column and
