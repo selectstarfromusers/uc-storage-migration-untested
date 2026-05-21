@@ -51,11 +51,11 @@ else:
 
 # COMMAND ----------
 # Identity values come from utils/config.py — edit there, not here.
-from utils.config import (
-    OLD_STORAGE_ACCOUNT,
-    NEW_STORAGE_ACCOUNT,
-    OPS_SCHEMA,
-)
+from utils import config as _cfg
+_cfg.resolve_config(spark=spark)
+OLD_STORAGE_ACCOUNT = _cfg.OLD_STORAGE_ACCOUNT
+NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
+OPS_SCHEMA = _cfg.OPS_SCHEMA
 
 # Per-run operational gates — stay in this notebook so a single edit to
 # utils/config.py can't arm destructive ops across multiple notebooks.

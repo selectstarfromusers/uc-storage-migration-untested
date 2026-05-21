@@ -51,13 +51,13 @@ else:
 
 # COMMAND ----------
 # All values come from utils/config.py — edit there, not here.
-from utils.config import (
-    OPS_SCHEMA,
-    THRESHOLDS,
-    ADLS_CLONE_GBPS_SAME_REGION,
-    ADLS_CLONE_GBPS_CROSS_REGION,
-    DBU_PER_HOUR,
-)
+from utils import config as _cfg
+_cfg.resolve_config(spark=spark)
+OPS_SCHEMA = _cfg.OPS_SCHEMA
+THRESHOLDS = _cfg.THRESHOLDS
+ADLS_CLONE_GBPS_SAME_REGION = _cfg.ADLS_CLONE_GBPS_SAME_REGION
+ADLS_CLONE_GBPS_CROSS_REGION = _cfg.ADLS_CLONE_GBPS_CROSS_REGION
+DBU_PER_HOUR = _cfg.DBU_PER_HOUR
 
 # COMMAND ----------
 # MAGIC %md

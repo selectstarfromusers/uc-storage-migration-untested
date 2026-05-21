@@ -73,14 +73,15 @@ else:
 
 # COMMAND ----------
 # All values come from utils/config.py — edit there, not here.
-from utils.config import (
-    OLD_STORAGE_ACCOUNT,
-    NEW_STORAGE_ACCOUNT,
-    CATALOG_ALLOWLIST,
-    OPS_SCHEMA,
-    COLLECT_SIZES,
-    LINEAGE_LOOKBACK_DAYS,
-)
+from utils import config as _cfg
+_cfg.resolve_config(spark=spark)  # auto-derive OPS_SCHEMA from CATALOG_ALLOWLIST[0] if unset
+_cfg.validate_config_for_discovery()  # raises if CATALOG_ALLOWLIST empty + ALLOW_ALL_CATALOGS not set
+OLD_STORAGE_ACCOUNT = _cfg.OLD_STORAGE_ACCOUNT
+NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
+CATALOG_ALLOWLIST = _cfg.CATALOG_ALLOWLIST
+OPS_SCHEMA = _cfg.OPS_SCHEMA
+COLLECT_SIZES = _cfg.COLLECT_SIZES
+LINEAGE_LOOKBACK_DAYS = _cfg.LINEAGE_LOOKBACK_DAYS
 
 # COMMAND ----------
 # MAGIC %md

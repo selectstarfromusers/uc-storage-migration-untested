@@ -47,11 +47,11 @@ else:
 
 # COMMAND ----------
 # All values come from utils/config.py — edit there, not here.
-from utils.config import (
-    NEW_STORAGE_ACCOUNT,
-    OPS_SCHEMA,
-    SAMPLE_LIMIT,
-)
+from utils import config as _cfg
+_cfg.resolve_config(spark=spark)
+NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
+OPS_SCHEMA = _cfg.OPS_SCHEMA
+SAMPLE_LIMIT = _cfg.SAMPLE_LIMIT
 
 # COMMAND ----------
 # MAGIC %md

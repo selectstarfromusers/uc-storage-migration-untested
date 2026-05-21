@@ -53,11 +53,12 @@ else:
 
 # COMMAND ----------
 # Identity values come from utils/config.py — edit there, not here.
-from utils.config import (
-    OLD_STORAGE_ACCOUNT,
-    NEW_STORAGE_ACCOUNT,
-    OPS_SCHEMA,
-)
+from utils import config as _cfg
+_cfg.resolve_config(spark=spark)
+OLD_STORAGE_ACCOUNT = _cfg.OLD_STORAGE_ACCOUNT
+NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
+OPS_SCHEMA = _cfg.OPS_SCHEMA
+ALLOW_MANAGED_VOLUMES_SKIP = _cfg.ALLOW_MANAGED_VOLUMES_SKIP
 
 # Per-run operational gates — stay in this notebook so a single edit to
 # utils/config.py can't arm destructive ops across multiple notebooks.
@@ -422,31 +423,13 @@ print("\nCoordinate with pipeline owners to refresh these tables after upstream 
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 8 — Cleanup (gated, dangerous)
+# MAGIC ## Next: run `04_validation`
 # MAGIC
-# MAGIC After validation has succeeded and the grace period has elapsed, drop the
-# MAGIC `*__pre_migration` tables. **Only run this cell after `04_validation`
-# MAGIC reports `overall_pass=True` for every migrated object.**
+# MAGIC `__pre_migration` shadow tables are intentionally kept for rollback
+# MAGIC safety. To remove them after validation passes + a grace period,
+# MAGIC run the separate `05_cleanup` notebook (gated by both
+# MAGIC `POST_VALIDATION_CLEANUP_OK` in `utils/config.py` AND
+# MAGIC `DRY_RUN=False` in that notebook).
 # MAGIC
-# MAGIC Flag name intentionally avoids the substring `CONFIRMED = False` so
-# MAGIC driver scripts that do `src.replace("CONFIRMED = False", ...)` to flip
-# MAGIC `CONFIRMED` don't accidentally enable cleanup too (real footgun seen
-# MAGIC during repo testing — silently dropped 119 `__pre_migration` shadows).
-
-# COMMAND ----------
-POST_VALIDATION_CLEANUP_OK = False  # set True only after validation + grace period
-
-if POST_VALIDATION_CLEANUP_OK:
-    log_rows = spark.sql(
-        f"SELECT pre_migration_fqn FROM {OPS_SCHEMA}.migration_log "
-        f"WHERE status = 'validated' AND pre_migration_fqn IS NOT NULL"
-    ).collect()
-    for row in log_rows:
-        fqn = row["pre_migration_fqn"]
-        try:
-            spark.sql(f"DROP TABLE {fqn}")
-            print(f"  dropped {fqn}")
-        except Exception as e:
-            print(f"  FAILED to drop {fqn}: {e}")
-else:
-    print("Cleanup skipped — set POST_VALIDATION_CLEANUP_OK=True to drop *__pre_migration tables.")
+# MAGIC Cleanup is irreversible — once shadows are dropped, `03a_rollback`
+# MAGIC can no longer restore the original state.

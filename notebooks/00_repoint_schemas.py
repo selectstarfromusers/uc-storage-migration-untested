@@ -56,11 +56,12 @@ else:
 
 # COMMAND ----------
 # Identity values come from utils/config.py — edit there, not here.
-from utils.config import (
-    REPOINT_CATALOG as CATALOG,
-    SCHEMAS_TO_REPOINT,
-    NEW_STORAGE_PREFIX,
-)
+from utils import config as _cfg
+_cfg.resolve_config(spark=spark)  # auto-derive REPOINT_CATALOG, SCHEMAS_TO_REPOINT if unset
+_cfg.validate_config_for_repoint()  # raises with clear message if anything missing
+CATALOG = _cfg.REPOINT_CATALOG
+SCHEMAS_TO_REPOINT = _cfg.SCHEMAS_TO_REPOINT
+NEW_STORAGE_PREFIX = _cfg.NEW_STORAGE_PREFIX
 
 # Per-run operational gate — stays in this notebook so a single edit to
 # utils/config.py can't arm a destructive op across multiple notebooks.
@@ -77,9 +78,8 @@ from utils.uc_admin import set_schema_storage_root, get_schema_storage_root
 
 
 w = WorkspaceClient()
-
-if not SCHEMAS_TO_REPOINT:
-    raise ValueError("SCHEMAS_TO_REPOINT is empty — set the schema list in the config cell.")
+# validate_config_for_repoint above already ensures SCHEMAS_TO_REPOINT
+# is non-empty.
 
 # COMMAND ----------
 # MAGIC %md
