@@ -115,6 +115,32 @@ external_old = [r for r in inv_rows if r["classification"] == "external_on_old"]
 print(f"drift_managed_on_old: {len(drift)}")
 print(f"external_on_old: {len(external_old)}")
 
+# Fail-fast on managed volumes in scope. The repo cannot migrate them
+# (Plan 2.1 scope). Customer must either handle them manually before
+# running 03b, or explicitly opt to skip them via
+# `ALLOW_MANAGED_VOLUMES_SKIP = True` in `utils/config.py`.
+managed_volumes_in_drift = [
+    r for r in drift
+    if r["object_type"] == "VOLUME" and r["table_type"] == "MANAGED"
+]
+if managed_volumes_in_drift:
+    print(f"\nFound {len(managed_volumes_in_drift)} managed volume(s) in drift:")
+    for r in managed_volumes_in_drift[:10]:
+        print(f"  {r['catalog']}.{r['schema']}.{r['name']}")
+    if len(managed_volumes_in_drift) > 10:
+        print(f"  ... and {len(managed_volumes_in_drift) - 10} more")
+
+    if not ALLOW_MANAGED_VOLUMES_SKIP:
+        raise RuntimeError(
+            f"Managed volumes ({len(managed_volumes_in_drift)}) are in scope but the "
+            "repo cannot migrate them (Plan 2.1 scope — manual handling needed: "
+            "dbutils.fs.cp → DROP VOLUME → CREATE MANAGED VOLUME → replay grants). "
+            "To proceed with table-only migration and skip volumes, set "
+            "`ALLOW_MANAGED_VOLUMES_SKIP = True` in utils/config.py."
+        )
+    print("\nALLOW_MANAGED_VOLUMES_SKIP=True — proceeding with table-only migration. "
+          "The listed managed volumes will be skipped.")
+
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## Step 1 — Pre-flight: external location for new account + per-object data presence
