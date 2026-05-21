@@ -106,7 +106,9 @@ else:
 
 # COMMAND ----------
 # All values come from utils/config.py — edit there, not here.
+import importlib
 from utils import config as _cfg
+importlib.reload(_cfg)  # pick up edits to utils/config.py without restarting Python
 _cfg.resolve_config(spark=spark)
 OPS_SCHEMA = _cfg.OPS_SCHEMA
 POST_VALIDATION_CLEANUP_OK = _cfg.POST_VALIDATION_CLEANUP_OK

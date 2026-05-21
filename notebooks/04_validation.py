@@ -95,7 +95,9 @@ else:
 
 # COMMAND ----------
 # All values come from utils/config.py — edit there, not here.
+import importlib
 from utils import config as _cfg
+importlib.reload(_cfg)  # pick up edits to utils/config.py without restarting Python
 _cfg.resolve_config(spark=spark)
 NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
 OPS_SCHEMA = _cfg.OPS_SCHEMA

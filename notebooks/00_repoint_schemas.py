@@ -105,7 +105,9 @@ else:
 
 # COMMAND ----------
 # Identity values come from utils/config.py — edit there, not here.
+import importlib
 from utils import config as _cfg
+importlib.reload(_cfg)  # pick up edits to utils/config.py without restarting Python
 _cfg.resolve_config(spark=spark)  # auto-derive REPOINT_CATALOG, SCHEMAS_TO_REPOINT if unset
 _cfg.validate_config_for_repoint()  # raises with clear message if anything missing
 CATALOG = _cfg.REPOINT_CATALOG

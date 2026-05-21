@@ -107,7 +107,9 @@ else:
 
 # COMMAND ----------
 # All values come from utils/config.py — edit there, not here.
+import importlib
 from utils import config as _cfg
+importlib.reload(_cfg)  # pick up edits to utils/config.py without restarting Python
 _cfg.resolve_config(spark=spark)  # auto-derive OPS_SCHEMA from CATALOG_ALLOWLIST[0] if unset
 _cfg.validate_config_for_discovery()  # raises if CATALOG_ALLOWLIST empty + ALLOW_ALL_CATALOGS not set
 OLD_STORAGE_ACCOUNT = _cfg.OLD_STORAGE_ACCOUNT
@@ -611,3 +613,170 @@ bytes_on_new = sum(
 rec = compute_recommendation(records, thresholds=DecisionThresholds(), bytes_on_new=bytes_on_new)
 md = render_summary_markdown(records=records, recommendation=rec)
 displayHTML(f"<pre>{md}</pre>")  # noqa: F821 (Databricks builtin)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Step 8 — Permission audit
+# MAGIC
+# MAGIC Checks whether the current user has the privileges required to run
+# MAGIC the remaining notebooks (`00_repoint_schemas`, `03b_forward_migrate`,
+# MAGIC `03a_rollback`, `04_validation`, `05_cleanup`). Reports deficits by
+# MAGIC object — does NOT raise. Discovery itself succeeded, so anything
+# MAGIC reported here is about the *destructive* notebooks.
+# MAGIC
+# MAGIC The audit checks:
+# MAGIC - Object ownership (owners have full control)
+# MAGIC - Direct + group grants via `SHOW GRANTS ON <securable>`
+# MAGIC - Catalogs need: `USE CATALOG`, `CREATE SCHEMA` (for ops schema)
+# MAGIC - Schemas need: `USE SCHEMA`, `CREATE TABLE`, plus `MANAGE` for native-UC repoint
+# MAGIC - Tables need: OWNER (for `RENAME`/`DROP` in `03b`/`03a`/`05`)
+# MAGIC - External locations matching NEW: `CREATE EXTERNAL TABLE`, `READ FILES`, `WRITE FILES`
+# MAGIC
+# MAGIC Caveats: `SHOW GRANTS` shows what's bound to specific principals; if
+# MAGIC a user has access via a group not surfaced by `current_user.me()`,
+# MAGIC the audit may flag a false-positive deficit. Treat the output as
+# MAGIC "things to verify", not absolute truth.
+
+# COMMAND ----------
+print("=" * 70)
+print("Permission audit")
+print("=" * 70)
+
+me_info = w.current_user.me()
+my_user = me_info.user_name
+my_groups = {g.display for g in (me_info.groups or [])} if getattr(me_info, "groups", None) else set()
+my_principals = {my_user} | my_groups
+print(f"Identity: {my_user}")
+print(f"Groups visible via SCIM: {sorted(my_groups) if my_groups else '(none — direct grants only will be matched)'}")
+print()
+
+deficits: list[str] = []
+
+
+def _my_privs(securable_kind: str, securable_name: str):
+    """Return set of privileges the current user has via any of their
+    surfaced principals. Returns None if SHOW GRANTS itself was denied
+    (treated as 'cannot verify')."""
+    try:
+        rows = spark.sql(f"SHOW GRANTS ON {securable_kind} {securable_name}").collect()
+    except Exception:
+        return None
+    privs = set()
+    for r in rows:
+        d = {k.lower(): v for k, v in r.asDict().items()}
+        principal = d.get("principal") or ""
+        priv = d.get("actiontype") or d.get("privilege")
+        if principal in my_principals and priv:
+            privs.add(priv)
+    return privs
+
+
+def _check(actual: "set | None", required: set, label: str):
+    """Return (ok, message)."""
+    if actual is None:
+        return False, f"could not enumerate grants for {label} (SHOW GRANTS denied)"
+    if "ALL PRIVILEGES" in actual:
+        return True, ""
+    missing = required - actual
+    if missing:
+        return False, f"{label}: missing {sorted(missing)}"
+    return True, ""
+
+
+# ---- Catalog audit ----
+print("--- Catalogs ---")
+for c in catalogs:
+    if c.catalog_type in {"FOREIGN_CATALOG", "DELTASHARING_CATALOG", "SYSTEM_CATALOG"}:
+        continue
+    if c.owner == my_user:
+        print(f"  {c.name}: OWNER ✓")
+        continue
+    privs = _my_privs("CATALOG", f"`{c.name}`")
+    ok, msg = _check(privs, {"USE CATALOG", "CREATE SCHEMA"}, f"CATALOG {c.name}")
+    if ok:
+        print(f"  {c.name}: USE+CREATE SCHEMA ✓ (owner={c.owner})")
+    else:
+        print(f"  {c.name}: ✗ {msg}")
+        deficits.append(msg)
+
+# ---- Schema audit ----
+print("\n--- Schemas (user-owned only; system/tool schemas skipped) ---")
+schema_required = {"USE SCHEMA", "CREATE TABLE"}
+schema_required_native = schema_required | {"MANAGE"}  # MANAGE needed for REST PATCH storage_root
+for cat_name, schemas in schemas_by_catalog.items():
+    cat_type = next((c.catalog_type for c in catalogs if c.name == cat_name), None)
+    is_native_uc = cat_type == "MANAGED_CATALOG"
+    required = schema_required_native if is_native_uc else schema_required
+    for s in schemas:
+        if s.name.startswith("_") or s.name in ("information_schema", "default"):
+            continue
+        full = f"{cat_name}.{s.name}"
+        if s.owner == my_user:
+            print(f"  {full}: OWNER ✓")
+            continue
+        privs = _my_privs("SCHEMA", f"`{cat_name}`.`{s.name}`")
+        ok, msg = _check(privs, required, f"SCHEMA {full}")
+        if ok:
+            print(f"  {full}: ✓ (owner={s.owner})")
+        else:
+            print(f"  {full}: ✗ {msg}")
+            deficits.append(msg)
+
+# ---- Table ownership audit ----
+# Tables need OWNER for RENAME (03b) and DROP (03a/05). Group by owner so we
+# don't spam thousands of lines for non-owners.
+print("\n--- Table ownership ---")
+in_scope_tables = tables_df  # already filtered by catalog allowlist
+non_owned = in_scope_tables[in_scope_tables["owner"] != my_user]
+if len(non_owned) == 0:
+    print(f"  All {len(in_scope_tables)} in-scope tables owned by {my_user} ✓")
+else:
+    by_owner = non_owned.groupby("owner").size().to_dict()
+    print(f"  {len(non_owned)} of {len(in_scope_tables)} table(s) not owned by you:")
+    for owner, n in sorted(by_owner.items(), key=lambda x: -x[1]):
+        print(f"    owner={owner}: {n} table(s)")
+    deficits.append(
+        f"{len(non_owned)} table(s) lack OWNER privilege. "
+        f"Owners: {dict(sorted(by_owner.items(), key=lambda x: -x[1]))}. "
+        "03b/03a/05 require OWNER (for RENAME/DROP). Either transfer ownership, "
+        "join the owning group, or run those notebooks as the table owner."
+    )
+
+# ---- External location audit (NEW) ----
+print("\n--- External locations matching NEW storage ---")
+new_token = NEW_STORAGE_ACCOUNT.split("/")[0]  # bucket or account portion, in case of prefix mode
+ext_locs_new = [el for el in ext_locs if new_token in (el.url or "")]
+if not ext_locs_new:
+    msg = (f"No external location URL contains '{new_token}'. "
+           "03b managed Delta DEEP CLONE writes through an external location bound "
+           "to the schema's storage_root; create one before running 03b.")
+    print(f"  ✗ {msg}")
+    deficits.append(msg)
+else:
+    ext_required = {"CREATE EXTERNAL TABLE", "READ FILES", "WRITE FILES"}
+    for el in ext_locs_new:
+        if el.owner == my_user:
+            print(f"  {el.name} ({el.url}): OWNER ✓")
+            continue
+        privs = _my_privs("EXTERNAL LOCATION", f"`{el.name}`")
+        ok, msg = _check(privs, ext_required, f"EXTERNAL LOCATION {el.name}")
+        if ok:
+            print(f"  {el.name}: ✓ (owner={el.owner})")
+        else:
+            print(f"  {el.name}: ✗ {msg}")
+            deficits.append(msg)
+
+# ---- Summary ----
+print("\n" + "=" * 70)
+if not deficits:
+    print("Permission audit: PASS — no deficits detected. ✓")
+else:
+    print(f"Permission audit: {len(deficits)} potential deficit(s) — review before running 03b/03a/05.")
+    print()
+    for i, d in enumerate(deficits, 1):
+        print(f"  {i}. {d}")
+    print()
+    print("Note: SHOW GRANTS surfaces direct + group grants for principals returned by")
+    print("current_user.me(). If you have access via an unsurfaced group, deficits above")
+    print("may be false positives — try a dry run of the relevant notebook to confirm.")
+print("=" * 70)
