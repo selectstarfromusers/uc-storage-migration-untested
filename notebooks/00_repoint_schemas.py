@@ -27,28 +27,77 @@
 # MAGIC ## Path setup
 
 # COMMAND ----------
-import os, sys
+import os
+import sys
 
 
-def _add_utils_to_path():
-    here = sys.path[0] if sys.path else os.getcwd()
-    candidate = here
-    for _ in range(5):
-        parent = os.path.dirname(candidate)
-        if parent == candidate:
-            break
-        if os.path.isdir(os.path.join(parent, "utils")):
-            if parent not in sys.path:
-                sys.path.insert(0, parent)
-            return
-        candidate = parent
+def _notebook_path() -> str | None:
+    """Return the absolute workspace path of this notebook, or None.
+
+    On Databricks serverless, sys.path[0] is the worker's tmp dir, not the
+    notebook's workspace path — so we have to ask Databricks directly.
+    """
+    try:
+        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
+        p = ctx.notebookPath().get()
+        # Returns like "/Users/.../uc-storage-migration/notebooks/01_discovery"
+        return f"/Workspace{p}" if p and not p.startswith("/Workspace") else p
+    except Exception:
+        return None
 
 
-_REPO_ROOT_HINT: str | None = None
-if _REPO_ROOT_HINT and _REPO_ROOT_HINT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT_HINT)
+def _add_utils_to_path() -> bool:
+    """Walk up looking for sibling utils/. Returns True if found.
+
+    Tries (in order):
+      1. The notebook's own workspace path via dbutils.notebook context.
+      2. sys.path[0] (works when running standalone / via %run).
+    Walks up either candidate looking for a sibling utils/ directory.
+    Silent on success.
+    """
+    starts: list[str] = []
+    nb = _notebook_path()
+    if nb:
+        starts.append(nb)
+    if sys.path:
+        starts.append(sys.path[0])
+    starts.append(os.getcwd())
+
+    for start in starts:
+        candidate = start
+        for _ in range(6):
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            if os.path.isdir(os.path.join(parent, "utils")):
+                if parent not in sys.path:
+                    sys.path.insert(0, parent)
+                return True
+            candidate = parent
+    return False
+
+
+_found = _add_utils_to_path()
+
+# Once utils is importable, an explicit REPO_ROOT_HINT in utils/config.py
+# overrides — for the rare layout where utils/ is not a sibling of
+# notebooks/. Customers set it ONCE in utils/config.py; every notebook
+# picks it up here.
+if _found:
+    try:
+        from utils.config import REPO_ROOT_HINT as _hint
+        if _hint and _hint not in sys.path:
+            sys.path.insert(0, _hint)
+    except ImportError:
+        pass
 else:
-    _add_utils_to_path()
+    raise RuntimeError(
+        "Could not auto-locate utils/ relative to this notebook. "
+        "If utils/ isn't a sibling of notebooks/ in your workspace, edit "
+        "this cell to add `sys.path.insert(0, '/Workspace/path/to/repo')` "
+        "above this block (then set REPO_ROOT_HINT in utils/config.py so "
+        "subsequent cells don't need the manual hack)."
+    )
 
 # COMMAND ----------
 # MAGIC %md

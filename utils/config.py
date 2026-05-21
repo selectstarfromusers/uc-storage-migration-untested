@@ -23,6 +23,22 @@ from typing import Optional
 
 
 # =============================================================================
+# Repo root hint (used by notebooks' path-setup cells)
+# =============================================================================
+#
+# Chicken-and-egg note: each notebook needs to add the repo root to sys.path
+# BEFORE it can `import utils.config`. So the notebook's path-setup cell
+# auto-discovers utils/ by walking up the filesystem first (using the
+# notebook's own workspace path via dbutils.notebook.entry_point). Only
+# AFTER that auto-discovery succeeds do the notebooks consult
+# REPO_ROOT_HINT here as a customer-set override.
+#
+# Set this only when auto-discovery doesn't work for your workspace layout.
+# Leave at None in the typical case where notebooks/ and utils/ are siblings.
+REPO_ROOT_HINT: Optional[str] = None
+
+
+# =============================================================================
 # Storage account / prefix identifiers
 # =============================================================================
 
