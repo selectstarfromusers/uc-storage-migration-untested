@@ -243,6 +243,8 @@ if not DRY_RUN:
 # MAGIC ## Step 4 — Revert schema storage_root via REST PATCH
 
 # COMMAND ----------
+from utils.paths import classify_url
+
 schemas_to_revert = []
 seen = set()
 inv_rows = spark.table(f"{OPS_SCHEMA}.inventory").collect()
@@ -252,9 +254,12 @@ for r in inv_rows:
         continue
     seen.add(key)
     parent = r["parent_managed_location"]
-    parsed = parse_storage_url(parent)
-    if parsed and parsed.account == NEW_STORAGE_ACCOUNT:
-        old_path = rewrite_account_in_path(parent, OLD_STORAGE_ACCOUNT)
+    # Use classify_url (not parsed.account == NEW) so prefix-mode works.
+    # In prefix mode the bucket equals OLD's bucket portion too; classify_url
+    # checks the full prefix path.
+    if parent and classify_url(parent, old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT) == "new":
+        old_path = rewrite_account_in_path(parent, OLD_STORAGE_ACCOUNT,
+                                           old_account=NEW_STORAGE_ACCOUNT)
         schemas_to_revert.append((r["catalog"], r["schema"], old_path))
 
 print(f"Schemas to revert: {len(schemas_to_revert)}")
@@ -289,9 +294,9 @@ catalogs = client.list_catalogs()
 for c in catalogs:
     if not c.storage_root:
         continue
-    parsed = parse_storage_url(c.storage_root)
-    if parsed and parsed.account == NEW_STORAGE_ACCOUNT:
-        old_path = rewrite_account_in_path(c.storage_root, OLD_STORAGE_ACCOUNT)
+    if classify_url(c.storage_root, old=OLD_STORAGE_ACCOUNT, new=NEW_STORAGE_ACCOUNT) == "new":
+        old_path = rewrite_account_in_path(c.storage_root, OLD_STORAGE_ACCOUNT,
+                                           old_account=NEW_STORAGE_ACCOUNT)
         if DRY_RUN:
             print(f"  DRY: PATCH /api/2.1/unity-catalog/catalogs/{c.name} "
                   f"storage_root='{old_path}'")

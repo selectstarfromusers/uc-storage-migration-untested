@@ -36,8 +36,8 @@ from typing import Optional
 # AWS-port escape hatch when both OLD and NEW need to live in the same
 # bucket under different prefixes. See utils/paths.py:classify_url for
 # semantics.
-OLD_STORAGE_ACCOUNT: str = "oldacct"
-NEW_STORAGE_ACCOUNT: str = "newacct"
+OLD_STORAGE_ACCOUNT: str = "artm-dev-ext-s3-049629455384-e2gq77/migration-test-new"
+NEW_STORAGE_ACCOUNT: str = "artm-dev-ext-s3-049629455384-e2gq77/migration-test-new-v2"
 
 
 # =============================================================================
@@ -56,7 +56,7 @@ OPS_SCHEMA: Optional[str] = None
 
 # Catalogs in scope for discovery + migration. REQUIRED — empty list
 # is refused unless ALLOW_ALL_CATALOGS=True (see below).
-CATALOG_ALLOWLIST: list[str] = []
+CATALOG_ALLOWLIST: list[str] = ["artm_dev_catalog"]
 
 # Escape hatch for "migrate every catalog in the metastore". Defaults
 # False because empty-allowlist-means-all is the kind of footgun that
@@ -97,7 +97,7 @@ SCHEMAS_TO_REPOINT: Optional[list[str]] = None
 # Not auto-derivable: knowing the container name (Azure) or full S3
 # prefix path requires customer input. Notebook errors with a clear
 # message if not set.
-NEW_STORAGE_PREFIX: str = ""
+NEW_STORAGE_PREFIX: str = "s3://artm-dev-ext-s3-049629455384-e2gq77/migration-test-new-v2/artm_dev_catalog"
 
 
 # =============================================================================
