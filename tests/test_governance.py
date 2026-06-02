@@ -10,6 +10,7 @@ from utils.governance import (
     build_show_row_filter_sql,
     parse_show_grants_rows,
     parse_show_tags_rows,
+    filter_direct_grants,
     build_replay_grants_sql,
     build_replay_owner_sql,
     build_replay_tags_sql,
@@ -66,6 +67,41 @@ def test_parse_show_grants_rows_handles_uc_capitalized_columns():
 def test_parse_show_grants_rows_skips_rows_with_no_principal():
     rows = [{"ActionType": "SELECT"}]  # malformed — no principal
     assert parse_show_grants_rows(rows) == []
+
+
+def test_filter_direct_grants_drops_inherited():
+    """Inherited catalog/schema/metastore grants must be dropped so replay
+    doesn't materialize them as explicit table-level grants."""
+    grants = [
+        GrantEntry(principal="alice@x.com", privilege="SELECT", object_type="TABLE"),
+        GrantEntry(principal="bob@x.com", privilege="ALL PRIVILEGES", object_type="CATALOG"),
+        GrantEntry(principal="team@x.com", privilege="SELECT", object_type="SCHEMA"),
+        GrantEntry(principal="root@x.com", privilege="USE CATALOG", object_type="METASTORE"),
+    ]
+    assert filter_direct_grants(grants, object_type="TABLE") == [
+        GrantEntry(principal="alice@x.com", privilege="SELECT", object_type="TABLE"),
+    ]
+
+
+def test_filter_direct_grants_volume_keeps_only_volume():
+    grants = [
+        GrantEntry(principal="u", privilege="READ VOLUME", object_type="VOLUME"),
+        GrantEntry(principal="g", privilege="ALL PRIVILEGES", object_type="CATALOG"),
+    ]
+    assert filter_direct_grants(grants, object_type="VOLUME") == [
+        GrantEntry(principal="u", privilege="READ VOLUME", object_type="VOLUME"),
+    ]
+
+
+def test_build_replay_grants_sql_skips_inherited_grants():
+    """Defense-in-depth: even if an inherited grant reaches replay (e.g. from a
+    pre-fix snapshot), it must not be emitted as a table-level GRANT."""
+    grants = [
+        GrantEntry(principal="alice@x.com", privilege="SELECT", object_type="TABLE"),
+        GrantEntry(principal="bob@x.com", privilege="ALL PRIVILEGES", object_type="CATALOG"),
+    ]
+    sqls = build_replay_grants_sql(catalog="c", schema="s", name="t", grants=grants)
+    assert sqls == ["GRANT SELECT ON TABLE `c`.`s`.`t` TO `alice@x.com`"]
 
 
 def test_parse_show_tags_rows():
@@ -177,6 +213,25 @@ class TestGovernanceCapturer:
         assert snap.tags == [TagEntry("pii", "true")]
         assert snap.column_comments == {"id": "primary key"}
         assert snap.table_properties == {"delta.columnMapping.mode": "name"}
+
+    def test_capture_drops_inherited_grants(self):
+        """SHOW GRANTS on a table returns catalog/schema-inherited grants too;
+        the captured snapshot must keep only the directly-granted ones."""
+        spark = _spark_returning(
+            [
+                _Row(principal="alice@x.com", action_type="SELECT", object_type="TABLE", object_key="c.s.t"),
+                _Row(principal="bob@x.com", action_type="ALL PRIVILEGES", object_type="CATALOG", object_key="c"),
+                _Row(principal="team@x.com", action_type="SELECT", object_type="SCHEMA", object_key="c.s"),
+            ],
+            [_Row(col_name="Owner", data_type="alice")],
+            [],  # tags
+            [],  # row filter
+            [],  # column masks
+            [],  # comments / describe
+            [],  # tblproperties
+        )
+        snap = GovernanceCapturer(spark=spark).capture(catalog="c", schema="s", name="t")
+        assert snap.grants == [GrantEntry("alice@x.com", "SELECT", "TABLE")]
 
 
 class TestGovernanceReplayer:

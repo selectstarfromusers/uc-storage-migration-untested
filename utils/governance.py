@@ -94,6 +94,28 @@ def parse_show_tags_rows(rows: list[dict]) -> list[TagEntry]:
     return [TagEntry(name=r["tag_name"], value=r["tag_value"]) for r in rows]
 
 
+# Object types that indicate a privilege is INHERITED from a parent securable
+# rather than granted directly on the object being captured.
+_INHERITED_OBJECT_TYPES = frozenset({"CATALOG", "SCHEMA", "METASTORE"})
+
+
+def filter_direct_grants(
+    grants: list[GrantEntry], *, object_type: str = "TABLE",
+) -> list[GrantEntry]:
+    """Keep only grants made DIRECTLY on the securable, dropping privileges
+    inherited from parent securables (catalog / schema / metastore).
+
+    ``SHOW GRANTS ON TABLE|VOLUME`` returns the *effective* privilege set — it
+    includes grants inherited from the parent catalog and schema, each row tagged
+    (via ObjectType) with the securable it was actually granted on. Replaying
+    those at the table level would materialize inherited privileges as explicit
+    table-level grants, defeating UC inheritance. We keep only rows whose
+    ObjectType matches the securable itself (TABLE for tables, VOLUME for volumes).
+    """
+    target = _object_keyword(object_type).upper()
+    return [g for g in grants if (g.object_type or target).upper() == target]
+
+
 # --- SQL builders for replay ---
 
 def _sql_quote_literal(s: str) -> str:
@@ -109,6 +131,11 @@ def build_replay_grants_sql(
     return [
         f"GRANT {g.privilege} ON {kw} {fqn} TO {quote_ident(g.principal)}"
         for g in grants
+        # Defense-in-depth: never materialize an inherited (catalog/schema/
+        # metastore) privilege as an explicit grant on this object. Capture
+        # already filters these, but guard here too in case a snapshot was
+        # taken before that fix.
+        if (g.object_type or "").upper() not in _INHERITED_OBJECT_TYPES
     ]
 
 
@@ -193,9 +220,13 @@ class GovernanceCapturer:
         return f"DESCRIBE {kw} EXTENDED {fqn}" if kw == "TABLE" else f"DESCRIBE {kw} {fqn}"
 
     def _capture_grants(self, c, s, n, ot) -> list[GrantEntry]:
-        return parse_show_grants_rows(self._rows(build_show_grants_sql(
+        all_grants = parse_show_grants_rows(self._rows(build_show_grants_sql(
             catalog=c, schema=s, name=n, object_type=ot,
         )))
+        # SHOW GRANTS returns the effective set (incl. catalog/schema-inherited
+        # grants); keep only those granted directly on this securable so replay
+        # doesn't flatten inherited privileges onto the migrated object.
+        return filter_direct_grants(all_grants, object_type=ot)
 
     def _capture_tags(self, c, s, n) -> list[TagEntry]:
         return parse_show_tags_rows(self._rows(build_show_tags_sql(catalog=c, schema=s, name=n)))
