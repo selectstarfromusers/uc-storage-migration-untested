@@ -180,6 +180,28 @@ def test_validate_content_checksum_external_is_na():
     assert result.content_checksum_ok is None  # N/A for external
 
 
+def test_validate_volume_uses_information_schema_location():
+    """Volumes: location from information_schema.volumes; row-based layers + the
+    content checksum are N/A; overall_pass rests on location + parent."""
+    spark = MagicMock()
+    fs = MagicMock()
+    spark.sql.side_effect = [
+        _result_mock([_row({"storage_location": "abfss://x@newacct.dfs.core.windows.net/v"})]),
+    ]
+    result = validate_object_on_new(
+        spark=spark, fs=fs, catalog="c", schema="s", name="v",
+        expected_new_account="newacct",
+        parent_managed_location="abfss://x@newacct.dfs.core.windows.net/",
+        is_delta=False, is_external=False, object_type="VOLUME",
+        verify_content_checksum=True, compare_fqn="`c`.`s`.`v__pre_migration`",
+    )
+    assert result.metadata_location_ok is True
+    assert result.input_file_name_ok is None       # N/A for volume
+    assert result.content_checksum_ok is None       # N/A for volume
+    assert result.parent_managed_location_match is True
+    assert result.overall_pass is True
+
+
 def test_parse_input_file_name_rows():
     rows = [
         type("R", (), {"asDict": lambda self: {"path": "abfss://c@n.dfs.core.windows.net/x/p1"}})(),

@@ -24,9 +24,10 @@ def test_build_drop_volume_sql():
     assert build_drop_volume_sql("c", "s", "v") == "DROP VOLUME `c`.`s`.`v`"
 
 
-def test_build_rename_volume_sql_takes_bare_new_name():
+def test_build_rename_volume_sql_qualifies_target():
+    # Target must be fully qualified (bare → CANNOT_RENAME_ACROSS_SCHEMA).
     assert build_rename_volume_sql("c", "s", "v__migrate_staging", "v") == (
-        "ALTER VOLUME `c`.`s`.`v__migrate_staging` RENAME TO `v`"
+        "ALTER VOLUME `c`.`s`.`v__migrate_staging` RENAME TO `c`.`s`.`v`"
     )
 
 

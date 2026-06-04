@@ -148,6 +148,7 @@ def validate_object_on_new(
     is_delta: bool,
     sample_limit: int = 10000,
     is_external: bool = False,
+    object_type: str = "TABLE",
     verify_content_checksum: bool = False,
     compare_fqn: Optional[str] = None,
 ) -> ValidationResult:
@@ -159,16 +160,28 @@ def validate_object_on_new(
     against the source; a mismatch fails `overall_pass` (i.e. it blocks).
     """
     fqn = quote_fqn(catalog, schema, name)
+    is_vol = (object_type or "").upper() == "VOLUME"
     evidence: dict = {}
 
-    # --- Layer 1: DESCRIBE EXTENDED → Location ---
+    # --- Layer 1: location is on the new account ---
+    # Volumes: DESCRIBE TABLE EXTENDED is invalid and you can't SELECT from one,
+    # so read storage_location from information_schema.volumes. Tables: parse
+    # DESCRIBE TABLE EXTENDED.
     try:
-        rows = spark.sql(f"DESCRIBE TABLE EXTENDED {fqn}").collect()
-        rendered = "\n".join(
-            "\t".join(str(c) if c is not None else "" for c in (r.asDict().values() if hasattr(r, "asDict") else r))
-            for r in rows
-        )
-        location = parse_describe_extended_location(rendered)
+        if is_vol:
+            vrows = spark.sql(
+                "SELECT storage_location FROM system.information_schema.volumes "
+                f"WHERE volume_catalog = '{catalog}' AND volume_schema = '{schema}' "
+                f"AND volume_name = '{name}'"
+            ).collect()
+            location = (vrows[0].asDict() if hasattr(vrows[0], "asDict") else dict(vrows[0]))["storage_location"] if vrows else None
+        else:
+            rows = spark.sql(f"DESCRIBE TABLE EXTENDED {fqn}").collect()
+            rendered = "\n".join(
+                "\t".join(str(c) if c is not None else "" for c in (r.asDict().values() if hasattr(r, "asDict") else r))
+                for r in rows
+            )
+            location = parse_describe_extended_location(rendered)
         evidence["describe_location"] = location
         metadata_ok = _is_on_account(location, expected_new_account)
     except Exception as e:
@@ -205,23 +218,27 @@ def validate_object_on_new(
     # reads from old. Mark as None and exclude from overall_pass so empty
     # tables can still pass when other layers agree.
     input_ok: Optional[bool]
-    try:
-        rows = spark.sql(
-            f"SELECT _metadata.file_path AS path FROM {fqn} LIMIT {sample_limit}"
-        ).collect()
-        paths = _parse_input_file_name_rows(rows)
-        hosts = _hosts_in_paths(paths)
-        evidence["input_file_name_hosts"] = sorted(hosts)
-        evidence["input_file_name_sample_count"] = len(paths)
-        if not paths:
-            input_ok = None
-            evidence["input_file_name_empty"] = True
-        else:
-            # Every sampled path must be on expected_new_account.
-            input_ok = bool(paths) and all(_is_on_account(p, expected_new_account) for p in paths)
-    except Exception as e:
-        input_ok = False
-        evidence["input_file_name_error"] = str(e)
+    if is_vol:
+        input_ok = None  # N/A: can't SELECT _metadata from a volume
+        evidence["input_file_name_skipped"] = "volume — no queryable rows"
+    else:
+        try:
+            rows = spark.sql(
+                f"SELECT _metadata.file_path AS path FROM {fqn} LIMIT {sample_limit}"
+            ).collect()
+            paths = _parse_input_file_name_rows(rows)
+            hosts = _hosts_in_paths(paths)
+            evidence["input_file_name_hosts"] = sorted(hosts)
+            evidence["input_file_name_sample_count"] = len(paths)
+            if not paths:
+                input_ok = None
+                evidence["input_file_name_empty"] = True
+            else:
+                # Every sampled path must be on expected_new_account.
+                input_ok = bool(paths) and all(_is_on_account(p, expected_new_account) for p in paths)
+        except Exception as e:
+            input_ok = False
+            evidence["input_file_name_error"] = str(e)
 
     # --- Layer 4: parent managed_location matches ---
     # For external objects the parent managed_location is informational only —
@@ -244,7 +261,7 @@ def validate_object_on_new(
     # retain a `__pre_migration` shadow to compare against. External objects are
     # dropped+recreated with no retained source, so there is nothing to diff.
     content_checksum_ok: Optional[bool]
-    if verify_content_checksum and compare_fqn and not is_external:
+    if verify_content_checksum and compare_fqn and not is_external and not is_vol:
         try:
             match, ev = compare_content_checksum(spark, source_fqn=compare_fqn, target_fqn=fqn)
             content_checksum_ok = match
@@ -254,7 +271,9 @@ def validate_object_on_new(
             evidence["content_checksum_error"] = str(e)
     else:
         content_checksum_ok = None
-        if verify_content_checksum and is_external:
+        if verify_content_checksum and is_vol:
+            evidence["content_checksum_skipped"] = "volume — file-level integrity is verified at migration time (03b Step 6.5)"
+        elif verify_content_checksum and is_external:
             evidence["content_checksum_skipped"] = "external object — no __pre_migration source to compare"
         elif verify_content_checksum and not compare_fqn:
             evidence["content_checksum_skipped"] = "no compare_fqn provided"

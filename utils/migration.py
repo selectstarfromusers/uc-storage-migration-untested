@@ -168,9 +168,12 @@ def build_drop_volume_sql(catalog: str, schema: str, name: str) -> str:
 
 
 def build_rename_volume_sql(catalog: str, schema: str, name: str, new_name: str) -> str:
-    """`new_name` is a bare volume name in the same schema (RENAME TO takes a
-    name, not a fully-qualified path)."""
-    return f"ALTER VOLUME {quote_fqn(catalog, schema, name)} RENAME TO {quote_ident(new_name)}"
+    """Rename a volume within its schema. The target MUST be fully qualified:
+    a bare name is resolved against the session's current schema and triggers
+    CANNOT_RENAME_ACROSS_SCHEMA. `new_name` is the bare new volume name; it is
+    qualified here with the same catalog/schema."""
+    return (f"ALTER VOLUME {quote_fqn(catalog, schema, name)} "
+            f"RENAME TO {quote_fqn(catalog, schema, new_name)}")
 
 
 def compare_volume_listings(old, new) -> tuple[bool, dict]:

@@ -474,33 +474,26 @@ for r in [x for x in drift if x["object_type"] == "TABLE" and x["data_source_for
 # MAGIC Skipped entirely when `ALLOW_MANAGED_VOLUMES_SKIP=True`.
 
 # COMMAND ----------
-def _volume_location(c, s, n):
-    """Storage location URL of a volume, via information_schema.volumes."""
-    rows = spark.sql(
-        "SELECT storage_location FROM system.information_schema.volumes "
-        f"WHERE volume_catalog = {_sql_lit(c)} AND volume_schema = {_sql_lit(s)} "
-        f"AND volume_name = {_sql_lit(n)}"
-    ).collect()
-    return rows[0]["storage_location"] if rows else None
-
-
-def _sql_lit(v):
-    return "'" + str(v).replace("'", "''") + "'"
-
-
 def _walk_volume(base):
-    """Recursive (relpath, size) listing of every file under a volume path."""
+    """Recursive (relpath, size) listing of every file under a /Volumes/ path.
+
+    relpath is computed by locating `base` WITHIN each returned path, so it is
+    robust to dbutils.fs.ls returning a `dbfs:` scheme prefix (and to the base
+    name differing in length between the source and staging volumes).
+    """
     base_norm = base.rstrip("/")
     out, stack = [], [base_norm]
     while stack:
         p = stack.pop()
         for e in dbutils.fs.ls(p):  # noqa: F821
-            if e.path.rstrip("/") == p:
-                continue
-            if e.size == 0 and e.path.endswith("/"):
-                stack.append(e.path)
+            ep = e.path
+            if ep.rstrip("/").endswith(base_norm):
+                continue  # the listed dir itself
+            if e.size == 0 and ep.endswith("/"):
+                stack.append(ep)
             else:
-                rel = e.path[len(base_norm):].lstrip("/")
+                idx = ep.find(base_norm)
+                rel = ep[idx + len(base_norm):].lstrip("/") if idx >= 0 else ep
                 out.append((rel, e.size))
     return out
 
@@ -531,15 +524,14 @@ else:
                                object_type="VOLUME", snapshot_json=_serialize_snapshot(snap))
             # 1. New managed volume (lands on the schema's new-storage location).
             spark.sql(build_create_managed_volume_sql(staging_c, staging_s, staging_n))
-            # 2. Resolve paths and copy.
-            old_path = _volume_location(rec.catalog, rec.schema, rec.name)
-            new_path = _volume_location(staging_c, staging_s, staging_n)
-            if not old_path or not new_path:
-                raise RuntimeError(f"could not resolve volume storage_location "
-                                   f"(old={old_path}, new={new_path})")
-            dbutils.fs.cp(old_path, new_path, recurse=True)  # noqa: F821
+            # 2. Copy via the governed /Volumes/ paths — NOT the raw
+            # __unitystorage storage_location (UC denies direct dbutils.fs
+            # access to managed storage: LOCATION_OVERLAP).
+            old_vol = f"/Volumes/{rec.catalog}/{rec.schema}/{rec.name}"
+            new_vol = f"/Volumes/{staging_c}/{staging_s}/{staging_n}"
+            dbutils.fs.cp(old_vol, new_vol, recurse=True)  # noqa: F821
             # 3. Verify file count/size/paths — BLOCK on mismatch.
-            match, ev = compare_volume_listings(_walk_volume(old_path), _walk_volume(new_path))
+            match, ev = compare_volume_listings(_walk_volume(old_vol), _walk_volume(new_vol))
             if not match:
                 spark.sql(build_drop_volume_sql(staging_c, staging_s, staging_n))
                 raise RuntimeError(f"managed-volume integrity mismatch (staging dropped, "

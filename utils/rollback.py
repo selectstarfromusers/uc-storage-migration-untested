@@ -82,7 +82,9 @@ def plan_rollback(
         # renames). Either way: drop migrated-if-present, rename shadow back.
         if orig_exists:
             steps.append((f"drop migrated {kw}", f"DROP {kw} IF EXISTS {orig_fqn}"))
-        steps.append(("restore shadow → orig", f"ALTER {kw} {pre_fqn} RENAME TO {_bare(name)}"))
+        # RENAME target must be fully qualified — a bare name resolves against
+        # the session schema (CANNOT_RENAME_ACROSS_SCHEMA), esp. for volumes.
+        steps.append(("restore shadow → orig", f"ALTER {kw} {pre_fqn} RENAME TO {orig_fqn}"))
         if staging_exists:
             steps.append((f"drop orphan staging {kw}", f"DROP {kw} IF EXISTS {staging_fqn}"))
         return steps
@@ -99,8 +101,3 @@ def plan_rollback(
         return [(WARN, f"{orig_fqn}: original + shadow both missing; only staging "
                        f"{staging_fqn} exists — manual review (data may be recoverable from staging)")]
     return [(ERROR, f"{orig_fqn}: original, shadow, and staging all missing — cannot roll back from this repo")]
-
-
-def _bare(name: str) -> str:
-    from utils.sql import quote_ident
-    return quote_ident(name)

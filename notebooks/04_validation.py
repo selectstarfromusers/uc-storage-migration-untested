@@ -149,15 +149,23 @@ for r in validated_rows:
         is_delta=(r["data_source_format"] == "DELTA"),
         sample_limit=SAMPLE_LIMIT,
         is_external=is_external,
+        object_type=r["object_type"],
         verify_content_checksum=VALIDATE_CONTENT_CHECKSUM,
         compare_fqn=compare_fqn,
     )
+    # Spark Connect's Arrow path errors on a boolean column that is mixed
+    # null/non-null across rows (volumes have N/A=None layers where tables have
+    # True/False). Persist the per-layer flags as definite booleans (None→False);
+    # the authoritative verdict is `overall_pass`, and `evidence_json` retains
+    # the per-layer N/A / skip reasons.
+    def _b(x):
+        return False if x is None else bool(x)
     results_rows.append((
         result.catalog, result.schema, result.name,
-        result.metadata_location_ok, result.delta_log_at_new_ok,
-        result.input_file_name_ok, result.parent_managed_location_match,
-        None, None, None, None, None, None,   # governance flags — Plan 2.1 expansion
-        result.content_checksum_ok,
+        _b(result.metadata_location_ok), _b(result.delta_log_at_new_ok),
+        _b(result.input_file_name_ok), _b(result.parent_managed_location_match),
+        False, False, False, False, False, False,   # governance flags — Plan 2.1 expansion
+        _b(result.content_checksum_ok),
         result.overall_pass,
         evidence_to_json(result),
         result.validated_at,

@@ -37,6 +37,7 @@ class ExternalLocationRecord:
     region: Optional[str] = None
     isolation_mode: Optional[str] = None
     accessible_in_current_workspace: Optional[bool] = None
+    owner: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,7 @@ class UcClient:
                 region=el.get("region"),
                 isolation_mode=el.get("isolation_mode"),
                 accessible_in_current_workspace=el.get("accessible_in_current_workspace"),
+                owner=el.get("owner"),
             )
             for el in resp.get("external_locations", [])
         ]

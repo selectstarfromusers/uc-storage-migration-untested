@@ -20,7 +20,7 @@ def test_managed_full_swap_restores_shadow():
     )
     assert _sql(steps) == (
         "DROP TABLE IF EXISTS `c`.`s`.`t` | "
-        "ALTER TABLE `c`.`s`.`t__pre_migration` RENAME TO `t`"
+        "ALTER TABLE `c`.`s`.`t__pre_migration` RENAME TO `c`.`s`.`t`"
     )
 
 
@@ -33,7 +33,7 @@ def test_managed_half_swap_orig_missing_restores_from_shadow():
     )
     # No drop of orig (it's gone); rename shadow back; drop the orphan staging.
     assert _labels(steps) == ["restore shadow → orig", "drop orphan staging TABLE"]
-    assert "ALTER TABLE `c`.`s`.`t__pre_migration` RENAME TO `t`" in _sql(steps)
+    assert "ALTER TABLE `c`.`s`.`t__pre_migration` RENAME TO `c`.`s`.`t`" in _sql(steps)
     assert "DROP TABLE IF EXISTS `c`.`s`.`t__migrate_staging`" in _sql(steps)
 
 
@@ -67,7 +67,7 @@ def test_managed_volume_full_swap_uses_volume_rename():
     )
     assert _sql(steps) == (
         "DROP VOLUME IF EXISTS `c`.`s`.`v` | "
-        "ALTER VOLUME `c`.`s`.`v__pre_migration` RENAME TO `v`"
+        "ALTER VOLUME `c`.`s`.`v__pre_migration` RENAME TO `c`.`s`.`v`"
     )
 
 
