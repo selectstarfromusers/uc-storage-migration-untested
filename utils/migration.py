@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from utils.discovery import ObjectRecord
 from utils.paths import AdlsPath, S3Path, parse_storage_url
-from utils.sql import quote_fqn
+from utils.sql import quote_fqn, quote_ident
 
 
 @dataclass(frozen=True)
@@ -147,3 +147,54 @@ def plan_external_volume_migration(
         ("drop", f"DROP VOLUME {orig}"),
         ("create", f"CREATE EXTERNAL VOLUME {orig} LOCATION '{new_path}'"),
     ])
+
+
+# --- Managed volume migration (staging-swap; copy is imperative, done in 03b) ---
+# Managed volumes have no DEEP CLONE and no ALTER VOLUME SET LOCATION. To move
+# one to new storage we create a fresh managed volume (which lands on the
+# schema's repointed managed location), physically copy the files into it,
+# verify, then swap names (orig -> __pre_migration, staging -> orig). These are
+# the pure SQL builders; the file copy + integrity verification live in the
+# notebook because they need dbutils.fs.
+
+def build_create_managed_volume_sql(catalog: str, schema: str, name: str) -> str:
+    """A managed volume is created with no LOCATION; UC places it at the
+    schema's managed location (repointed to new storage by 00_repoint_schemas)."""
+    return f"CREATE VOLUME {quote_fqn(catalog, schema, name)}"
+
+
+def build_drop_volume_sql(catalog: str, schema: str, name: str) -> str:
+    return f"DROP VOLUME {quote_fqn(catalog, schema, name)}"
+
+
+def build_rename_volume_sql(catalog: str, schema: str, name: str, new_name: str) -> str:
+    """`new_name` is a bare volume name in the same schema (RENAME TO takes a
+    name, not a fully-qualified path)."""
+    return f"ALTER VOLUME {quote_fqn(catalog, schema, name)} RENAME TO {quote_ident(new_name)}"
+
+
+def compare_volume_listings(old, new) -> tuple[bool, dict]:
+    """Compare two recursive volume file listings for copy completeness.
+
+    Each listing is an iterable of ``(relpath, size_bytes)``. A match requires
+    the SAME set of relative paths AND identical sizes per path. This is
+    file-level count+size+path integrity (not a per-file content hash); the
+    storage layer checksums each object on write, and `dbutils.fs.cp` is a
+    faithful copy, so count+size+path is a strong completeness gate.
+
+    Returns ``(match, evidence)``.
+    """
+    old_map = {rp: sz for rp, sz in old}
+    new_map = {rp: sz for rp, sz in new}
+    old_keys, new_keys = set(old_map), set(new_map)
+    missing = sorted(old_keys - new_keys)        # present in source, not copied
+    extra = sorted(new_keys - old_keys)          # present in target, unexpected
+    size_mismatch = sorted(p for p in (old_keys & new_keys) if old_map[p] != new_map[p])
+    match = not missing and not extra and not size_mismatch
+    evidence = {
+        "old_file_count": len(old_map), "new_file_count": len(new_map),
+        "old_total_bytes": sum(old_map.values()), "new_total_bytes": sum(new_map.values()),
+        "missing": missing[:50], "extra": extra[:50], "size_mismatch": size_mismatch[:50],
+        "match": match,
+    }
+    return match, evidence

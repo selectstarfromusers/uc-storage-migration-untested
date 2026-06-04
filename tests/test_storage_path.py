@@ -53,7 +53,9 @@ def test_uses_volume_keyword_for_volumes():
         info_schema_path=None, object_type="VOLUME",
     )
     call_args = spark.sql.call_args[0][0]
-    assert "DESCRIBE EXTENDED VOLUME" in call_args
+    # EXTENDED is invalid for volumes — the code uses "DESCRIBE VOLUME".
+    assert "DESCRIBE VOLUME" in call_args
+    assert "EXTENDED" not in call_args
     assert "`c`.`s`.`v`" in call_args
 
 

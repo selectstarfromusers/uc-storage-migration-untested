@@ -102,6 +102,7 @@ _cfg.resolve_config(spark=spark)
 NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
 OPS_SCHEMA = _cfg.OPS_SCHEMA
 SAMPLE_LIMIT = _cfg.SAMPLE_LIMIT
+VALIDATE_CONTENT_CHECKSUM = _cfg.VALIDATE_CONTENT_CHECKSUM
 
 # COMMAND ----------
 # MAGIC %md
@@ -112,6 +113,8 @@ from datetime import datetime, timezone
 
 from utils.validation import validate_object_on_new, evidence_to_json
 from utils.state import VALIDATION_RESULTS_SCHEMA, ValidationResultsWriter
+from utils.migration import derive_pre_migration_fqn
+from utils.sql import quote_fqn
 
 
 validated_rows = spark.sql(
@@ -131,6 +134,13 @@ writer.ensure_exists()
 fs = dbutils.fs  # noqa: F821
 results_rows = []
 for r in validated_rows:
+    is_external = (r["table_type"] == "EXTERNAL")
+    # Content checksum compares the migrated table to its retained
+    # `__pre_migration` shadow — only managed objects have one.
+    compare_fqn = None
+    if VALIDATE_CONTENT_CHECKSUM and not is_external:
+        pc, ps, pn = derive_pre_migration_fqn(r["catalog"], r["schema"], r["name"])
+        compare_fqn = quote_fqn(pc, ps, pn)
     result = validate_object_on_new(
         spark=spark, fs=fs,
         catalog=r["catalog"], schema=r["schema"], name=r["name"],
@@ -138,13 +148,16 @@ for r in validated_rows:
         parent_managed_location=r["parent_managed_location"],
         is_delta=(r["data_source_format"] == "DELTA"),
         sample_limit=SAMPLE_LIMIT,
-        is_external=(r["table_type"] == "EXTERNAL"),
+        is_external=is_external,
+        verify_content_checksum=VALIDATE_CONTENT_CHECKSUM,
+        compare_fqn=compare_fqn,
     )
     results_rows.append((
         result.catalog, result.schema, result.name,
         result.metadata_location_ok, result.delta_log_at_new_ok,
         result.input_file_name_ok, result.parent_managed_location_match,
         None, None, None, None, None, None,   # governance flags — Plan 2.1 expansion
+        result.content_checksum_ok,
         result.overall_pass,
         evidence_to_json(result),
         result.validated_at,
@@ -154,13 +167,15 @@ for r in validated_rows:
           f"(meta={result.metadata_location_ok} "
           f"delta_log={result.delta_log_at_new_ok} "
           f"input_file={result.input_file_name_ok} "
-          f"parent={result.parent_managed_location_match})")
+          f"parent={result.parent_managed_location_match} "
+          f"checksum={result.content_checksum_ok})")
 
 if results_rows:
     writer.overwrite(results_rows)
     _OVERALL_PASS_IDX = VALIDATION_RESULTS_SCHEMA.fieldNames().index("overall_pass")
     pass_count = sum(1 for r in results_rows if r[_OVERALL_PASS_IDX])
-    print(f"\n{pass_count} / {len(results_rows)} passed all four evidence layers.")
+    print(f"\n{pass_count} / {len(results_rows)} passed all evidence layers"
+          f"{' (incl. content checksum)' if VALIDATE_CONTENT_CHECKSUM else ''}.")
 
 # COMMAND ----------
 # MAGIC %md

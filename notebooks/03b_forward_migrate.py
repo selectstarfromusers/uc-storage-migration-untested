@@ -130,6 +130,8 @@ from utils.migration import (
     plan_managed_delta_migration, plan_managed_non_delta_migration,
     plan_external_table_migration, plan_external_volume_migration,
     derive_pre_migration_fqn, derive_staging_fqn,
+    build_create_managed_volume_sql, build_drop_volume_sql,
+    build_rename_volume_sql, compare_volume_listings,
 )
 from utils.preflight import (
     check_external_location_for, probe_path_exists, probe_partition_completeness,
@@ -165,10 +167,10 @@ external_old = [r for r in inv_rows if r["classification"] == "external_on_old"]
 print(f"drift_managed_on_old: {len(drift)}")
 print(f"external_on_old: {len(external_old)}")
 
-# Fail-fast on managed volumes in scope. The repo cannot migrate them
-# (Plan 2.1 scope). Customer must either handle them manually before
-# running 03b, or explicitly opt to skip them via
-# `ALLOW_MANAGED_VOLUMES_SKIP = True` in `utils/config.py`.
+# Managed volumes in scope are migrated by Step 6.5 (staging-swap: create new
+# managed volume → copy files → verify → rename swap → replay grants), unless
+# `ALLOW_MANAGED_VOLUMES_SKIP = True` in `utils/config.py`, in which case they
+# are listed and skipped (table-only migration).
 managed_volumes_in_drift = [
     r for r in drift
     if r["object_type"] == "VOLUME" and r["table_type"] == "MANAGED"
@@ -179,17 +181,12 @@ if managed_volumes_in_drift:
         print(f"  {r['catalog']}.{r['schema']}.{r['name']}")
     if len(managed_volumes_in_drift) > 10:
         print(f"  ... and {len(managed_volumes_in_drift) - 10} more")
-
-    if not ALLOW_MANAGED_VOLUMES_SKIP:
-        raise RuntimeError(
-            f"Managed volumes ({len(managed_volumes_in_drift)}) are in scope but the "
-            "repo cannot migrate them (Plan 2.1 scope — manual handling needed: "
-            "dbutils.fs.cp → DROP VOLUME → CREATE MANAGED VOLUME → replay grants). "
-            "To proceed with table-only migration and skip volumes, set "
-            "`ALLOW_MANAGED_VOLUMES_SKIP = True` in utils/config.py."
-        )
-    print("\nALLOW_MANAGED_VOLUMES_SKIP=True — proceeding with table-only migration. "
-          "The listed managed volumes will be skipped.")
+    if ALLOW_MANAGED_VOLUMES_SKIP:
+        print("\nALLOW_MANAGED_VOLUMES_SKIP=True — these managed volumes will be "
+              "SKIPPED (table-only migration).")
+    else:
+        print("\nThese will be migrated in Step 6.5 (set ALLOW_MANAGED_VOLUMES_SKIP=True "
+              "to skip). The runner needs CREATE VOLUME on the schema + OWNER on the volumes.")
 
 # COMMAND ----------
 # MAGIC %md
@@ -464,26 +461,104 @@ for r in [x for x in drift if x["object_type"] == "TABLE" and x["data_source_for
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 6.5 — Managed volumes (deferred to Plan 2.1)
+# MAGIC ## Step 6.5 — Migrate managed volumes (staging-swap)
 # MAGIC
-# MAGIC Managed volumes on old storage require: (1) physical data copy via
-# MAGIC `dbutils.fs.cp` from old to new managed path, (2) DROP + CREATE MANAGED
-# MAGIC VOLUME, (3) governance replay. Spec §9.3 item 5. This is Plan 2.1 scope —
-# MAGIC surfaced here so they are not silently missed.
+# MAGIC Managed volumes have no `DEEP CLONE` and no `ALTER VOLUME SET LOCATION`.
+# MAGIC Per volume: create a new managed volume (lands on the schema's repointed
+# MAGIC new-storage location) → physically copy files in → **verify file
+# MAGIC count/size/paths** → rename `orig`→`__pre_migration`, `staging`→`orig` →
+# MAGIC replay grants. The original is retained as `__pre_migration` (dropped
+# MAGIC later by `05_cleanup`), and an integrity mismatch **blocks** that volume
+# MAGIC (staging dropped, original untouched, logged failed).
+# MAGIC
+# MAGIC Skipped entirely when `ALLOW_MANAGED_VOLUMES_SKIP=True`.
 
 # COMMAND ----------
+def _volume_location(c, s, n):
+    """Storage location URL of a volume, via information_schema.volumes."""
+    rows = spark.sql(
+        "SELECT storage_location FROM system.information_schema.volumes "
+        f"WHERE volume_catalog = {_sql_lit(c)} AND volume_schema = {_sql_lit(s)} "
+        f"AND volume_name = {_sql_lit(n)}"
+    ).collect()
+    return rows[0]["storage_location"] if rows else None
+
+
+def _sql_lit(v):
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def _walk_volume(base):
+    """Recursive (relpath, size) listing of every file under a volume path."""
+    base_norm = base.rstrip("/")
+    out, stack = [], [base_norm]
+    while stack:
+        p = stack.pop()
+        for e in dbutils.fs.ls(p):  # noqa: F821
+            if e.path.rstrip("/") == p:
+                continue
+            if e.size == 0 and e.path.endswith("/"):
+                stack.append(e.path)
+            else:
+                rel = e.path[len(base_norm):].lstrip("/")
+                out.append((rel, e.size))
+    return out
+
+
 managed_volumes = [r for r in drift if r["object_type"] == "VOLUME" and r["table_type"] == "MANAGED"]
-if managed_volumes:
-    print(f"{len(managed_volumes)} managed volume(s) on old storage — deferred:")
-    for r in managed_volumes:
-        print(f"  {r['catalog']}.{r['schema']}.{r['name']}")
-    print("\nThese need manual handling:")
-    print("  1. dbutils.fs.cp(old_path, new_path, recurse=True)")
-    print("  2. DROP VOLUME <fqn>")
-    print("  3. CREATE MANAGED VOLUME <fqn>")
-    print("  4. Replay grants via utils.governance.GovernanceReplayer")
-else:
+if not managed_volumes:
     print("No managed volumes on old storage.")
+elif ALLOW_MANAGED_VOLUMES_SKIP:
+    print(f"ALLOW_MANAGED_VOLUMES_SKIP=True — skipping {len(managed_volumes)} managed volume(s).")
+else:
+    for r in managed_volumes:
+        rec = _row_to_record(r)
+        if not mig_log.claim(catalog=rec.catalog, schema=rec.schema, name=rec.name,
+                             object_type="VOLUME", actor=ACTOR):
+            continue
+        try:
+            snap = capturer.capture(catalog=rec.catalog, schema=rec.schema,
+                                    name=rec.name, object_type="VOLUME")
+            staging_c, staging_s, staging_n = derive_staging_fqn(rec.catalog, rec.schema, rec.name)
+            pre_c, pre_s, pre_n = derive_pre_migration_fqn(rec.catalog, rec.schema, rec.name)
+            if DRY_RUN:
+                print(f"  [DRY RUN] would migrate managed volume {rec.catalog}.{rec.schema}.{rec.name} "
+                      f"(create {staging_n} → copy → verify → swap → replay)")
+                mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name, status="claimed")
+                continue
+
+            snap_writer.append(catalog=rec.catalog, schema=rec.schema, name=rec.name,
+                               object_type="VOLUME", snapshot_json=_serialize_snapshot(snap))
+            # 1. New managed volume (lands on the schema's new-storage location).
+            spark.sql(build_create_managed_volume_sql(staging_c, staging_s, staging_n))
+            # 2. Resolve paths and copy.
+            old_path = _volume_location(rec.catalog, rec.schema, rec.name)
+            new_path = _volume_location(staging_c, staging_s, staging_n)
+            if not old_path or not new_path:
+                raise RuntimeError(f"could not resolve volume storage_location "
+                                   f"(old={old_path}, new={new_path})")
+            dbutils.fs.cp(old_path, new_path, recurse=True)  # noqa: F821
+            # 3. Verify file count/size/paths — BLOCK on mismatch.
+            match, ev = compare_volume_listings(_walk_volume(old_path), _walk_volume(new_path))
+            if not match:
+                spark.sql(build_drop_volume_sql(staging_c, staging_s, staging_n))
+                raise RuntimeError(f"managed-volume integrity mismatch (staging dropped, "
+                                   f"original untouched): {ev}")
+            # 4. Swap: keep original as __pre_migration, promote staging.
+            spark.sql(build_rename_volume_sql(rec.catalog, rec.schema, rec.name, pre_n))
+            spark.sql(build_rename_volume_sql(staging_c, staging_s, staging_n, rec.name))
+            # 5. Replay governance onto the promoted volume.
+            replayer.replay(snap, target_fqn=(rec.catalog, rec.schema, rec.name), object_type="VOLUME")
+            mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name,
+                           status="validated",
+                           staging_fqn=f"{staging_c}.{staging_s}.{staging_n}",
+                           pre_migration_fqn=f"{pre_c}.{pre_s}.{pre_n}")
+            print(f"  migrated managed volume: {rec.catalog}.{rec.schema}.{rec.name} "
+                  f"({ev['new_file_count']} files, {ev['new_total_bytes']} bytes)")
+        except Exception as e:
+            mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name,
+                           status="failed", error_trace=traceback.format_exc())
+            print(f"  FAILED managed volume {rec.catalog}.{rec.schema}.{rec.name}: {e}")
 
 # COMMAND ----------
 # MAGIC %md

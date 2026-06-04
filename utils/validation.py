@@ -43,6 +43,7 @@ class ValidationResult:
     delta_log_at_new_ok: Optional[bool]
     input_file_name_ok: Optional[bool]      # None if table was empty (no files to sample)
     parent_managed_location_match: Optional[bool]  # None if N/A (external object)
+    content_checksum_ok: Optional[bool]            # None if N/A (disabled / external / no source)
     overall_pass: bool
     evidence: dict
     validated_at: datetime
@@ -86,6 +87,55 @@ def _parse_input_file_name_rows(rows) -> list[str]:
     return out
 
 
+def build_content_checksum_sql(fqn: str) -> str:
+    """Order-independent, multiplicity-sensitive content fingerprint of a table.
+
+    - ``xxhash64(*)`` hashes the typed columns positionally (NULL-safe, no
+      CONCAT/delimiter ambiguity), 64-bit.
+    - ``bit_xor`` is order-independent (file layout doesn't matter).
+    - ``sum(... as decimal(38,0))`` is also order-independent but, unlike XOR,
+      does NOT cancel even-count duplicate rows — so it catches row-multiplicity
+      differences that ``bit_xor`` alone would miss. decimal(38,0) avoids overflow.
+    - ``count(*)`` catches gross row-count differences.
+
+    Two tables are considered identical iff all three of (n, xor64, sum64) match.
+    `fqn` must already be quoted (use utils.sql.quote_fqn).
+    """
+    return (
+        "SELECT count(*) AS n, "
+        "coalesce(bit_xor(xxhash64(*)), 0) AS xor64, "
+        "coalesce(sum(cast(xxhash64(*) AS decimal(38,0))), 0) AS sum64 "
+        f"FROM {fqn}"
+    )
+
+
+def _checksum_row(spark: "_SqlExec", fqn: str) -> dict:
+    rows = spark.sql(build_content_checksum_sql(fqn)).collect()
+    r = rows[0]
+    d = r.asDict() if hasattr(r, "asDict") else dict(r)
+    # Normalize to comparable, JSON-serializable primitives. decimal/bigint → str.
+    return {
+        "n": int(d["n"]) if d.get("n") is not None else None,
+        "xor64": str(d["xor64"]) if d.get("xor64") is not None else None,
+        "sum64": str(d["sum64"]) if d.get("sum64") is not None else None,
+    }
+
+
+def compare_content_checksum(spark: "_SqlExec", *, source_fqn: str, target_fqn: str) -> tuple[bool, dict]:
+    """Compute the content fingerprint of both tables and report whether they match.
+
+    Returns (match, evidence). `source_fqn` is typically the retained
+    ``<table>__pre_migration`` shadow; `target_fqn` is the migrated table.
+    """
+    src = _checksum_row(spark, source_fqn)
+    tgt = _checksum_row(spark, target_fqn)
+    match = (src["n"] == tgt["n"] and src["xor64"] == tgt["xor64"] and src["sum64"] == tgt["sum64"])
+    return match, {
+        "source_fqn": source_fqn, "target_fqn": target_fqn,
+        "source": src, "target": tgt, "match": match,
+    }
+
+
 def validate_object_on_new(
     *,
     spark: _SqlExec,
@@ -98,8 +148,16 @@ def validate_object_on_new(
     is_delta: bool,
     sample_limit: int = 10000,
     is_external: bool = False,
+    verify_content_checksum: bool = False,
+    compare_fqn: Optional[str] = None,
 ) -> ValidationResult:
-    """Run all four evidence layers against the migrated object and return a result."""
+    """Run the evidence layers against the migrated object and return a result.
+
+    When `verify_content_checksum` is True and `compare_fqn` (the retained
+    pre-migration source, already quoted) is provided for a managed object, a
+    fifth layer compares a full-table content fingerprint of the migrated table
+    against the source; a mismatch fails `overall_pass` (i.e. it blocks).
+    """
     fqn = quote_fqn(catalog, schema, name)
     evidence: dict = {}
 
@@ -181,8 +239,28 @@ def validate_object_on_new(
         parent_ok = False
         evidence["parent_layer_no_location"] = True
 
+    # --- Layer 5: full-table content checksum vs the pre-migration source ---
+    # Gated (off unless enabled) and only meaningful for managed objects, which
+    # retain a `__pre_migration` shadow to compare against. External objects are
+    # dropped+recreated with no retained source, so there is nothing to diff.
+    content_checksum_ok: Optional[bool]
+    if verify_content_checksum and compare_fqn and not is_external:
+        try:
+            match, ev = compare_content_checksum(spark, source_fqn=compare_fqn, target_fqn=fqn)
+            content_checksum_ok = match
+            evidence["content_checksum"] = ev
+        except Exception as e:
+            content_checksum_ok = False
+            evidence["content_checksum_error"] = str(e)
+    else:
+        content_checksum_ok = None
+        if verify_content_checksum and is_external:
+            evidence["content_checksum_skipped"] = "external object — no __pre_migration source to compare"
+        elif verify_content_checksum and not compare_fqn:
+            evidence["content_checksum_skipped"] = "no compare_fqn provided"
+
     # overall_pass: every non-None layer must be True; None means N/A and is skipped.
-    layer_results = [metadata_ok, delta_log_ok, input_ok, parent_ok]
+    layer_results = [metadata_ok, delta_log_ok, input_ok, parent_ok, content_checksum_ok]
     overall = all(lr is not False for lr in layer_results) and any(lr is True for lr in layer_results)
 
     return ValidationResult(
@@ -191,6 +269,7 @@ def validate_object_on_new(
         delta_log_at_new_ok=delta_log_ok,
         input_file_name_ok=input_ok,
         parent_managed_location_match=parent_ok,
+        content_checksum_ok=content_checksum_ok,
         overall_pass=overall,
         evidence=evidence,
         validated_at=datetime.now(timezone.utc).replace(tzinfo=None),

@@ -780,3 +780,42 @@ else:
     print("current_user.me(). If you have access via an unsurfaced group, deficits above")
     print("may be false positives — try a dry run of the relevant notebook to confirm.")
 print("=" * 70)
+
+# ---- Remediation: ready-to-run GRANT statements for missing privileges ----
+# Turns the free-text privilege deficits above into copy-paste SQL. Run these
+# AS A PRINCIPAL THAT CAN GRANT (securable owner / metastore admin). Table
+# OWNER deficits aren't covered here — those need ALTER ... OWNER TO or group
+# membership, not a GRANT (see the table-ownership deficit text above).
+import re as _re
+
+_KIND_GRANTABLE = {"CATALOG": "CATALOG", "SCHEMA": "SCHEMA", "EXTERNAL LOCATION": "EXTERNAL LOCATION"}
+_grant_sql: list[str] = []
+for d in deficits:
+    m = _re.match(r"^(CATALOG|SCHEMA|EXTERNAL LOCATION) (.+?): missing (\[.*\])$", d)
+    if not m:
+        continue
+    kind, name, privs_repr = m.group(1), m.group(2), m.group(3)
+    try:
+        privs = [p for p in __import__("ast").literal_eval(privs_repr)]
+    except Exception:
+        continue
+    # Quote each dotted identifier component: cat.schema -> `cat`.`schema`
+    qname = ".".join(f"`{part}`" for part in name.split("."))
+    _grant_sql.append(f"GRANT {', '.join(privs)} ON {_KIND_GRANTABLE[kind]} {qname} TO `{my_user}`;")
+
+if _grant_sql:
+    print("\nSuggested GRANTs to clear the privilege deficits above")
+    print("(run as a securable owner or metastore admin; review before executing):")
+    print("-" * 70)
+    for g in _grant_sql:
+        print(g)
+    print("-" * 70)
+
+# Heads-up for managed-volume migration (03b Step 6.5): in addition to the
+# table privileges audited above, the runner needs `CREATE VOLUME` on each
+# target schema and OWNER on the managed volumes (for DROP + RENAME during the
+# staging swap). Volumes are not individually audited here.
+if any(getattr(r, "object_type", None) == "VOLUME" and getattr(r, "table_type", None) == "MANAGED"
+       for r in records):
+    print("\nManaged volumes are in scope: ensure you also hold CREATE VOLUME on the "
+          "target schema(s) and OWNER on those volumes before running 03b.")

@@ -8,7 +8,58 @@ from utils.migration import (
     plan_external_volume_migration,
     derive_pre_migration_fqn,
     derive_staging_fqn,
+    build_create_managed_volume_sql,
+    build_drop_volume_sql,
+    build_rename_volume_sql,
+    compare_volume_listings,
 )
+
+
+def test_build_create_managed_volume_sql_has_no_location():
+    # Managed volume = no LOCATION clause (UC places it at the schema location).
+    assert build_create_managed_volume_sql("c", "s", "v") == "CREATE VOLUME `c`.`s`.`v`"
+
+
+def test_build_drop_volume_sql():
+    assert build_drop_volume_sql("c", "s", "v") == "DROP VOLUME `c`.`s`.`v`"
+
+
+def test_build_rename_volume_sql_takes_bare_new_name():
+    assert build_rename_volume_sql("c", "s", "v__migrate_staging", "v") == (
+        "ALTER VOLUME `c`.`s`.`v__migrate_staging` RENAME TO `v`"
+    )
+
+
+def test_compare_volume_listings_match():
+    old = [("a/1.bin", 100), ("b/2.bin", 200)]
+    new = [("b/2.bin", 200), ("a/1.bin", 100)]  # order-independent
+    match, ev = compare_volume_listings(old, new)
+    assert match is True
+    assert ev["old_total_bytes"] == 300 and ev["new_total_bytes"] == 300
+
+
+def test_compare_volume_listings_missing_file_blocks():
+    old = [("a/1.bin", 100), ("b/2.bin", 200)]
+    new = [("a/1.bin", 100)]
+    match, ev = compare_volume_listings(old, new)
+    assert match is False
+    assert ev["missing"] == ["b/2.bin"]
+
+
+def test_compare_volume_listings_size_mismatch_blocks():
+    old = [("a/1.bin", 100)]
+    new = [("a/1.bin", 101)]
+    match, ev = compare_volume_listings(old, new)
+    assert match is False
+    assert ev["size_mismatch"] == ["a/1.bin"]
+
+
+def test_compare_volume_listings_extra_file_blocks():
+    old = [("a/1.bin", 100)]
+    new = [("a/1.bin", 100), ("c/3.bin", 5)]
+    match, ev = compare_volume_listings(old, new)
+    assert match is False
+    assert ev["extra"] == ["c/3.bin"]
 
 
 def make_rec(*, table_type="MANAGED", data_source_format="DELTA"):

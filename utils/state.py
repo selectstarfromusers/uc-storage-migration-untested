@@ -105,6 +105,7 @@ VALIDATION_RESULTS_SCHEMA = StructType([
     StructField("row_filter_ok", BooleanType(), True),
     StructField("column_mask_ok", BooleanType(), True),
     StructField("comments_ok", BooleanType(), True),
+    StructField("content_checksum_ok", BooleanType(), True),
     StructField("overall_pass", BooleanType(), False),
     StructField("evidence_json", StringType(), False),
     StructField("validated_at", TimestampType(), False),

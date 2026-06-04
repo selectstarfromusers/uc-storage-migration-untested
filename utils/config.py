@@ -157,11 +157,12 @@ DBU_PER_HOUR: float = 1.5
 # Forward-migrate tunables (03b_forward_migrate)
 # =============================================================================
 
-# Behavior when discovery finds MANAGED VOLUMEs in scope. The repo
-# currently cannot migrate managed volumes (Plan 2.1 scope).
-#   False (default): 03b refuses to start. Customer must handle volumes
-#     manually before retrying.
-#   True: 03b logs the volumes and proceeds with table migration only.
+# Behavior when discovery finds MANAGED VOLUMEs in scope. 03b now migrates
+# them in Step 6.5 via a staging-swap (create new managed volume → copy files
+# → verify count/size/paths → rename swap → replay grants; original kept as
+# `__pre_migration`, integrity mismatch blocks that volume).
+#   False (default): migrate managed volumes in Step 6.5.
+#   True: skip managed volumes (table-only migration); they are listed only.
 ALLOW_MANAGED_VOLUMES_SKIP: bool = False
 
 
@@ -173,6 +174,17 @@ ALLOW_MANAGED_VOLUMES_SKIP: bool = False
 # layer (Layer 3 in validate_object_on_new). Higher = more confidence;
 # lower = faster validation across thousands of tables.
 SAMPLE_LIMIT: int = 10000
+
+# Run a full-table content checksum during validation, comparing each migrated
+# managed table against its retained `__pre_migration` shadow (order-independent
+# xxhash64 fingerprint: count + bit_xor + sum). A mismatch FAILS that object's
+# overall_pass (blocks). This is the strongest "data copied uncorrupted" proof,
+# but it is a full scan of both copies — set False to skip for very large
+# estates or time-boxed runs.
+#   True (default): checksum every migrated managed table.
+#   False: skip the checksum layer (marked N/A).
+# N/A for external tables (no retained source to diff).
+VALIDATE_CONTENT_CHECKSUM: bool = True
 
 
 # =============================================================================
