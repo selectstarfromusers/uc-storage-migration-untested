@@ -131,7 +131,10 @@ import json
 
 from utils.discovery import ObjectRecord
 from utils.governance import GovernanceCapturer
-from utils.migration import rewrite_account_in_path
+from utils.migration import (
+    rewrite_account_in_path, derive_staging_fqn, derive_pre_migration_fqn,
+)
+from utils.rollback import plan_rollback, NOOP, WARN, ERROR
 from utils.paths import parse_storage_url
 from utils.sql import quote_fqn
 from utils.state import MigrationLog
@@ -153,15 +156,19 @@ w = WorkspaceClient()
 # COMMAND ----------
 # Join migration_log (what 03b did) with inventory (pre-migration state)
 # to know each object's original storage_path for external recreate.
+# Every status that could have left a side effect — including partial/failed
+# runs. Rollback is existence-driven (Step 3), so over-including is safe:
+# objects that turn out untouched resolve to a no-op.
 rollback_rows = spark.sql(f"""
 SELECT
-  m.catalog, m.schema, m.name, m.object_type, m.pre_migration_fqn,
+  m.catalog, m.schema, m.name, m.object_type, m.pre_migration_fqn, m.staging_fqn,
   m.status AS mig_status,
   i.table_type, i.data_source_format, i.storage_path AS original_storage_path
 FROM {OPS_SCHEMA}.migration_log m
 LEFT JOIN {OPS_SCHEMA}.inventory i
   ON m.catalog = i.catalog AND m.schema = i.schema AND m.name = i.name
-WHERE m.status IN ('validated', 'cloned', 'swapped', 'replayed', 'snapshot_taken')
+WHERE m.status IN ('snapshot_taken', 'cloned', 'swapped', 'replayed',
+                   'validated', 'failed', 'rollback_failed')
 """).collect()
 
 print(f"Rollback candidates: {len(rollback_rows)} object(s) recorded in migration_log")
@@ -180,45 +187,47 @@ if len(rollback_rows) > 5:
 # MAGIC row). If any are missing, refuse to proceed.
 
 # COMMAND ----------
-def _table_exists(fqn: str) -> bool:
-    """True if the table exists in UC."""
-    if not fqn:
+def _object_exists(catalog, schema, name, object_type="TABLE") -> bool:
+    """True if a table OR volume exists in UC (information_schema)."""
+    if not (catalog and schema and name):
         return False
+    if (object_type or "").upper() == "VOLUME":
+        view, col = "volumes", "volume"
+    else:
+        view, col = "tables", "table"
     try:
-        parts = fqn.replace("`", "").split(".")
-        if len(parts) != 3:
-            return False
-        cat, sch, name = parts
         n = spark.sql(
-            "SELECT count(*) AS n FROM system.information_schema.tables "
-            f"WHERE table_catalog = '{cat}' AND table_schema = '{sch}' "
-            f"AND table_name = '{name}'"
+            f"SELECT count(*) AS n FROM system.information_schema.{view} "
+            f"WHERE {col}_catalog = '{catalog}' AND {col}_schema = '{schema}' "
+            f"AND {col}_name = '{name}'"
         ).collect()[0]["n"]
         return int(n) > 0
     except Exception:
         return False
 
 
-missing_shadows = []
+# No hard abort: rollback is now per-object and existence-driven, so a missing
+# shadow only blocks the object(s) that genuinely need it (handled as an ERROR
+# in Step 3) — not the whole run. We do surface a heads-up for the dangerous
+# case: a fully-swapped object whose shadow is gone (e.g. 05_cleanup ran).
+_swapped_states = {"swapped", "replayed", "validated"}
+_unrecoverable = []
 for r in rollback_rows:
-    if r["pre_migration_fqn"]:
-        if not _table_exists(r["pre_migration_fqn"]):
-            missing_shadows.append(r["pre_migration_fqn"])
+    if r["mig_status"] in _swapped_states:
+        pc, ps, pn = derive_pre_migration_fqn(r["catalog"], r["schema"], r["name"])
+        orig_here = _object_exists(r["catalog"], r["schema"], r["name"], r["object_type"])
+        shadow_here = _object_exists(pc, ps, pn, r["object_type"])
+        if not shadow_here and not orig_here:
+            _unrecoverable.append(f"{r['catalog']}.{r['schema']}.{r['name']}")
 
-if missing_shadows:
-    print(f"\n{len(missing_shadows)} __pre_migration shadow(s) are MISSING:")
-    for fqn in missing_shadows[:10]:
+if _unrecoverable:
+    print(f"\n⚠ {len(_unrecoverable)} swapped object(s) have NEITHER the live object NOR "
+          "the __pre_migration shadow (cleanup may have run) — these CANNOT be rolled "
+          "back from this repo and will be flagged in Step 3:")
+    for fqn in _unrecoverable[:10]:
         print(f"  {fqn}")
-    if len(missing_shadows) > 10:
-        print(f"  ... and {len(missing_shadows) - 10} more")
-    raise RuntimeError(
-        "Rollback is impossible from this repo: __pre_migration shadows "
-        "have been dropped (likely by 05_cleanup). The original tables "
-        "no longer exist in UC. Restore from an external backup if you "
-        "have one, or re-migrate from a known-good source."
-    )
-
-print(f"All {sum(1 for r in rollback_rows if r['pre_migration_fqn'])} expected shadow(s) present.")
+else:
+    print("Shadow pre-check: no unrecoverable swapped objects detected.")
 
 # COMMAND ----------
 # MAGIC %md
@@ -231,46 +240,45 @@ mig_log.ensure_exists()
 succeeded = 0
 failed = 0
 
+skipped = 0
 for r in rollback_rows:
     catalog, schema, name = r["catalog"], r["schema"], r["name"]
     obj_type = r["object_type"]
-    table_type = r["table_type"]
-    pre_fqn = r["pre_migration_fqn"]
-    original_path = r["original_storage_path"]
-    orig_fqn = quote_fqn(catalog, schema, name)
 
-    # Build the rollback SQL plan based on what 03b did.
-    steps: list[tuple[str, str]] = []
+    # Resolve shadow + staging FQNs (prefer the logged value; else derive the
+    # conventional name), then probe what ACTUALLY exists right now.
+    pc, ps, pn = derive_pre_migration_fqn(catalog, schema, name)
+    sc, ss, sn = derive_staging_fqn(catalog, schema, name)
+    orig_exists = _object_exists(catalog, schema, name, obj_type)
+    pre_exists = _object_exists(pc, ps, pn, obj_type)
+    staging_exists = _object_exists(sc, ss, sn, obj_type)
 
-    if obj_type == "TABLE" and pre_fqn:
-        # Managed table — undo the rename swap.
-        steps.append(("drop migrated TABLE", f"DROP TABLE {orig_fqn}"))
-        steps.append(("rename shadow back", f"ALTER TABLE {pre_fqn} RENAME TO {orig_fqn}"))
-    elif obj_type == "TABLE" and table_type == "EXTERNAL":
-        # External table — drop + recreate at the original path.
-        if not original_path:
-            print(f"  SKIP {catalog}.{schema}.{name}: external table but no original_storage_path in inventory")
-            continue
-        fmt = (r["data_source_format"] or "DELTA").upper()
-        steps.append(("drop migrated TABLE", f"DROP TABLE {orig_fqn}"))
-        steps.append(("recreate at old path",
-                      f"CREATE EXTERNAL TABLE {orig_fqn} USING {fmt} LOCATION '{original_path}'"))
-    elif obj_type == "VOLUME":
-        # External volume — drop + recreate.
-        if not original_path:
-            print(f"  SKIP {catalog}.{schema}.{name}: volume but no original_storage_path")
-            continue
-        steps.append(("drop migrated VOLUME", f"DROP VOLUME {orig_fqn}"))
-        steps.append(("recreate volume at old path",
-                      f"CREATE EXTERNAL VOLUME {orig_fqn} LOCATION '{original_path}'"))
-    else:
-        print(f"  SKIP {catalog}.{schema}.{name}: cannot infer rollback plan "
-              f"(object_type={obj_type}, table_type={table_type}, pre_fqn={pre_fqn})")
+    steps = plan_rollback(
+        object_type=obj_type, table_type=r["table_type"],
+        catalog=catalog, schema=schema, name=name,
+        pre_fqn=quote_fqn(pc, ps, pn), staging_fqn=quote_fqn(sc, ss, sn),
+        orig_exists=orig_exists, pre_exists=pre_exists, staging_exists=staging_exists,
+        original_path=r["original_storage_path"], data_source_format=r["data_source_format"],
+    )
+
+    state = f"orig={int(orig_exists)} pre={int(pre_exists)} staging={int(staging_exists)}"
+    head = steps[0][0]
+    if head == NOOP:
+        print(f"  noop  {catalog}.{schema}.{name} [{state}]: {steps[0][1]}")
+        skipped += 1
+        continue
+    if head in (WARN, ERROR):
+        print(f"  {'WARN ' if head == WARN else 'ERROR'} {catalog}.{schema}.{name} [{state}]: {steps[0][1]}")
+        if not DRY_RUN:
+            mig_log.update(catalog=catalog, schema=schema, name=name,
+                           status="rollback_failed", error_trace=steps[0][1])
+            failed += 1
         continue
 
     if DRY_RUN:
+        print(f"  DRY {catalog}.{schema}.{name} [{state}] ({r['mig_status']}):")
         for label, sql in steps:
-            print(f"  DRY [{label}]: {sql}")
+            print(f"      [{label}] {sql}")
         continue
 
     try:
@@ -278,7 +286,7 @@ for r in rollback_rows:
             spark.sql(sql)
         mig_log.update(catalog=catalog, schema=schema, name=name, status="rolled_back")
         succeeded += 1
-        print(f"  rolled back: {catalog}.{schema}.{name}")
+        print(f"  rolled back ({r['mig_status']} → rolled_back): {catalog}.{schema}.{name} [{state}]")
     except Exception as e:
         mig_log.update(catalog=catalog, schema=schema, name=name,
                        status="rollback_failed", error_trace=str(e))
@@ -286,7 +294,7 @@ for r in rollback_rows:
         print(f"  FAILED rollback for {catalog}.{schema}.{name}: {e}")
 
 if not DRY_RUN:
-    print(f"\nRollback complete: {succeeded} rolled back, {failed} failed.")
+    print(f"\nRollback complete: {succeeded} rolled back, {failed} failed, {skipped} no-op.")
 
 # COMMAND ----------
 # MAGIC %md
