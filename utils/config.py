@@ -173,17 +173,20 @@ ALLOW_MANAGED_VOLUMES_SKIP: bool = False
 # kept (low overhead, already battle-tested on small volumes).
 LARGE_VOLUME_FILE_THRESHOLD: int = 5000
 
-# Parallelism for the DRIVER-side threaded copy (default mechanism — uses
-# dbutils.fs.cp per file across a bounded thread pool; works everywhere,
-# including serverless). dbutils.fs.cp is I/O-bound, so many threads give a
-# large speedup over the sequential loop without needing executors.
-VOLUME_COPY_PARALLELISM: int = 64
+# Parallelism (thread count) for the DRIVER-side threaded copy — the default
+# mechanism. The copier uses a local FUSE `shutil.copyfile` per file (NOT
+# dbutils.fs.cp), which benchmarked 4-6x faster on serverless and keeps scaling
+# with threads up to ~512, where it plateaus (~62 files/s; serverless
+# fevm-artm-dev, 2026-06-16). 512 is the recommended serverless default;
+# dbutils.fs.cp by contrast capped at ~64. Lower it only on tiny driver compute.
+VOLUME_COPY_PARALLELISM: int = 512
 
 # Opt-in: fan the copy across Spark EXECUTORS (foreachPartition + local
-# `/Volumes` FUSE copy) instead of driver threads. Faster on large
-# all-purpose/dedicated clusters, but executor FUSE *writes* to UC Volumes are
-# not guaranteed on every compute type (notably serverless) — validate in the
-# target workspace before enabling. Default False = driver-threaded copy.
+# `/Volumes` FUSE copy) instead of driver threads. Benchmarking on serverless
+# showed NO gain over the driver-threaded shutil copy (serverless didn't add
+# executor lanes), so leave this False there. It can help on large
+# all-purpose/dedicated clusters with many worker cores — validate executor
+# FUSE writes in the target workspace before enabling. Default False.
 VOLUME_DISTRIBUTED_COPY: bool = False
 VOLUME_DISTRIBUTED_COPY_PARTITIONS: int = 256
 

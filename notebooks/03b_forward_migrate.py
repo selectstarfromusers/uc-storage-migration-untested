@@ -504,19 +504,32 @@ def _walk_volume(base):
 
 
 def _copy_files_threaded(pairs, parallelism):
-    """Driver-side parallel copy of [(src, dst, rel, size), ...] via dbutils.fs.cp.
+    """Driver-side parallel copy of [(src, dst, rel, size), ...] over the FUSE
+    /Volumes mount with shutil.copyfile.
 
-    dbutils.fs.cp is I/O-bound (a per-file object-store PUT), so a bounded
-    thread pool turns the sequential recurse-copy into hundreds of concurrent
-    copies without needing executors — works on every compute type including
-    serverless. Each cp creates parent dirs implicitly. Returns the count
-    copied. Raises the first worker exception (so the volume is logged failed
-    and staging is kept for a resumable re-run)."""
+    Mechanism matters more than thread count. Benchmarked on serverless
+    (fevm-artm-dev, 2026-06-16), per-file throughput by copy mechanism:
+        old dbutils.fs.cp(recurse=True) ......  4 files/s
+        dbutils.fs.cp threaded @64 ..........  ~10-14 files/s (plateaus ~P64)
+        shutil.copyfile FUSE threaded @512 ...  ~62 files/s  <-- this
+    dbutils.fs.cp round-trips a service call per file and contends across
+    threads; a local FUSE copy is 4-6x faster and keeps scaling with threads
+    up to ~512 (plateaus there). Works on serverless (no executors needed).
+
+    Per-file resumable skip (exists + matching size) so a re-run after a
+    timeout only moves the remainder. Returns the count copied (incl. skips).
+    Raises the first worker exception, so the volume is logged failed and
+    staging is kept for a resumable re-run."""
+    import os
+    import shutil
     from concurrent.futures import ThreadPoolExecutor
 
     def _one(p):
-        src, dst, _rel, _sz = p
-        dbutils.fs.cp(src, dst)  # noqa: F821
+        src, dst, _rel, sz = p
+        if os.path.exists(dst) and os.path.getsize(dst) == sz:
+            return
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
 
     n = 0
     with ThreadPoolExecutor(max_workers=parallelism) as ex:
