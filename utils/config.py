@@ -165,6 +165,28 @@ DBU_PER_HOUR: float = 1.5
 #   True: skip managed volumes (table-only migration); they are listed only.
 ALLOW_MANAGED_VOLUMES_SKIP: bool = False
 
+# Managed-volume copy strategy (Step 6.5). A single sequential
+# `dbutils.fs.cp(recurse=True)` is driver-bound and per-file latency-limited:
+# a volume with hundreds of thousands of small files cannot finish inside a
+# job timeout. At/above LARGE_VOLUME_FILE_THRESHOLD files, the copy is fanned
+# out instead of run sequentially; below it, the proven simple recurse-copy is
+# kept (low overhead, already battle-tested on small volumes).
+LARGE_VOLUME_FILE_THRESHOLD: int = 5000
+
+# Parallelism for the DRIVER-side threaded copy (default mechanism — uses
+# dbutils.fs.cp per file across a bounded thread pool; works everywhere,
+# including serverless). dbutils.fs.cp is I/O-bound, so many threads give a
+# large speedup over the sequential loop without needing executors.
+VOLUME_COPY_PARALLELISM: int = 64
+
+# Opt-in: fan the copy across Spark EXECUTORS (foreachPartition + local
+# `/Volumes` FUSE copy) instead of driver threads. Faster on large
+# all-purpose/dedicated clusters, but executor FUSE *writes* to UC Volumes are
+# not guaranteed on every compute type (notably serverless) — validate in the
+# target workspace before enabling. Default False = driver-threaded copy.
+VOLUME_DISTRIBUTED_COPY: bool = False
+VOLUME_DISTRIBUTED_COPY_PARTITIONS: int = 256
+
 
 # =============================================================================
 # Validation tunables (04_validation)
@@ -185,6 +207,28 @@ SAMPLE_LIMIT: int = 10000
 #   False: skip the checksum layer (marked N/A).
 # N/A for external tables (no retained source to diff).
 VALIDATE_CONTENT_CHECKSUM: bool = True
+
+# Run a full-file content checksum for managed VOLUMES during validation —
+# the volume analogue of VALIDATE_CONTENT_CHECKSUM above. Compares each
+# migrated volume to its retained `__pre_migration` shadow file-by-file
+# (md5 over bytes, matched by relpath). A mismatch FAILS that volume's
+# overall_pass. This reads 100% of the bytes of BOTH copies (~2x the volume
+# size), so it is OFF by default — count+size+path (compare_volume_listings,
+# enforced at migration time in 03b Step 6.5) remains the always-on gate.
+#   False (default): skip volume content hashing (count+size+path only).
+#   True: hash in-scope files on both copies and compare.
+VALIDATE_VOLUME_CONTENT_CHECKSUM: bool = False
+
+# Sampling lever for volumes too large to fully hash. Hash only this fraction
+# of files, selected DETERMINISTICALLY by a stable hash of the relpath so the
+# source and target pick the SAME files; the remainder still get
+# count+size+path. 1.0 = hash everything. Ignored when the flag above is False.
+VOLUME_CHECKSUM_SAMPLE_FRACTION: float = 1.0
+
+# Files larger than this are hashed in streamed chunks on the driver instead of
+# loaded whole via Spark binaryFile (whose content column is capped at ~2 GB);
+# avoids a MAX_LENGTH error mid-validation on big files. Bytes.
+VOLUME_CHECKSUM_MAX_INMEMORY_BYTES: int = 2 * 1024 * 1024 * 1024
 
 
 # =============================================================================

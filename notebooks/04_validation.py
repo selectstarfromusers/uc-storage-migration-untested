@@ -103,6 +103,9 @@ NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
 OPS_SCHEMA = _cfg.OPS_SCHEMA
 SAMPLE_LIMIT = _cfg.SAMPLE_LIMIT
 VALIDATE_CONTENT_CHECKSUM = _cfg.VALIDATE_CONTENT_CHECKSUM
+VALIDATE_VOLUME_CONTENT_CHECKSUM = _cfg.VALIDATE_VOLUME_CONTENT_CHECKSUM
+VOLUME_CHECKSUM_SAMPLE_FRACTION = _cfg.VOLUME_CHECKSUM_SAMPLE_FRACTION
+VOLUME_CHECKSUM_MAX_INMEMORY_BYTES = _cfg.VOLUME_CHECKSUM_MAX_INMEMORY_BYTES
 
 # COMMAND ----------
 # MAGIC %md
@@ -113,8 +116,64 @@ from datetime import datetime, timezone
 
 from utils.validation import validate_object_on_new, evidence_to_json
 from utils.state import VALIDATION_RESULTS_SCHEMA, ValidationResultsWriter
-from utils.migration import derive_pre_migration_fqn
+from utils.migration import derive_pre_migration_fqn, select_checksum_sample
 from utils.sql import quote_fqn
+
+
+def _walk_volume(base):
+    """Recursive (relpath, size) listing under a /Volumes/ path (see 03b)."""
+    base_norm = base.rstrip("/")
+    out, stack = [], [base_norm]
+    while stack:
+        p = stack.pop()
+        for e in dbutils.fs.ls(p):  # noqa: F821
+            ep = e.path
+            if ep.rstrip("/").endswith(base_norm):
+                continue
+            if e.size == 0 and ep.endswith("/"):
+                stack.append(ep)
+            else:
+                idx = ep.find(base_norm)
+                rel = ep[idx + len(base_norm):].lstrip("/") if idx >= 0 else ep
+                out.append((rel, e.size))
+    return out
+
+
+def _hash_big_file(path, chunk=8 * 1024 * 1024):
+    """Stream-hash a single file via the FUSE /Volumes path (avoids the
+    binaryFile ~2 GB content-column cap). Returns a hex md5 string."""
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _hash_volume_files(vol_path, sample_fraction, max_inmem):
+    """Produce [(relpath, md5_hex)] for (a sample of) a volume's files.
+
+    Sampling is deterministic by relpath (select_checksum_sample), so the
+    source shadow and the migrated volume independently pick the SAME files.
+    Small files are hashed in bulk via Spark binaryFile (distributed); files
+    larger than `max_inmem` are streamed-hashed on the driver."""
+    from pyspark.sql.functions import md5 as _md5, col
+    base = vol_path.rstrip("/")
+    sampled = select_checksum_sample(_walk_volume(vol_path), sample_fraction)
+    small = [(rel, sz) for rel, sz in sampled if sz <= max_inmem]
+    big = [(rel, sz) for rel, sz in sampled if sz > max_inmem]
+    out = []
+    if small:
+        paths = [f"{base}/{rel}" for rel, _ in small]
+        df = spark.read.format("binaryFile").load(paths)
+        for row in df.select("path", _md5(col("content")).alias("h")).collect():
+            ep = row["path"]
+            idx = ep.find(base)
+            rel = ep[idx + len(base):].lstrip("/") if idx >= 0 else ep
+            out.append((rel, row["h"]))
+    for rel, _ in big:
+        out.append((rel, _hash_big_file(f"{base}/{rel}")))
+    return out
 
 
 validated_rows = spark.sql(
@@ -135,12 +194,28 @@ fs = dbutils.fs  # noqa: F821
 results_rows = []
 for r in validated_rows:
     is_external = (r["table_type"] == "EXTERNAL")
+    is_vol = (r["object_type"] == "VOLUME")
     # Content checksum compares the migrated table to its retained
     # `__pre_migration` shadow — only managed objects have one.
     compare_fqn = None
     if VALIDATE_CONTENT_CHECKSUM and not is_external:
         pc, ps, pn = derive_pre_migration_fqn(r["catalog"], r["schema"], r["name"])
         compare_fqn = quote_fqn(pc, ps, pn)
+    # Layer 6: per-file content hash for managed volumes. Read 100% of bytes of
+    # both copies (the live volume + its __pre_migration shadow), so it's gated.
+    vol_source_hashes = vol_target_hashes = None
+    if VALIDATE_VOLUME_CONTENT_CHECKSUM and is_vol and not is_external:
+        pc, ps, pn = derive_pre_migration_fqn(r["catalog"], r["schema"], r["name"])
+        live_path = f"/Volumes/{r['catalog']}/{r['schema']}/{r['name']}"
+        shadow_path = f"/Volumes/{pc}/{ps}/{pn}"
+        try:
+            vol_source_hashes = _hash_volume_files(
+                shadow_path, VOLUME_CHECKSUM_SAMPLE_FRACTION, VOLUME_CHECKSUM_MAX_INMEMORY_BYTES)
+            vol_target_hashes = _hash_volume_files(
+                live_path, VOLUME_CHECKSUM_SAMPLE_FRACTION, VOLUME_CHECKSUM_MAX_INMEMORY_BYTES)
+        except Exception as e:
+            # Leave hashes None → Layer 6 records "no listings"; surface the cause.
+            print(f"  (volume hash failed for {r['catalog']}.{r['schema']}.{r['name']}: {e})")
     result = validate_object_on_new(
         spark=spark, fs=fs,
         catalog=r["catalog"], schema=r["schema"], name=r["name"],
@@ -152,6 +227,9 @@ for r in validated_rows:
         object_type=r["object_type"],
         verify_content_checksum=VALIDATE_CONTENT_CHECKSUM,
         compare_fqn=compare_fqn,
+        verify_volume_content_checksum=VALIDATE_VOLUME_CONTENT_CHECKSUM,
+        volume_source_hashes=vol_source_hashes,
+        volume_target_hashes=vol_target_hashes,
     )
     # Spark Connect's Arrow path errors on a boolean column that is mixed
     # null/non-null across rows (volumes have N/A=None layers where tables have
@@ -166,6 +244,7 @@ for r in validated_rows:
         _b(result.input_file_name_ok), _b(result.parent_managed_location_match),
         False, False, False, False, False, False,   # governance flags — Plan 2.1 expansion
         _b(result.content_checksum_ok),
+        _b(result.volume_content_checksum_ok),
         result.overall_pass,
         evidence_to_json(result),
         result.validated_at,
@@ -176,14 +255,20 @@ for r in validated_rows:
           f"delta_log={result.delta_log_at_new_ok} "
           f"input_file={result.input_file_name_ok} "
           f"parent={result.parent_managed_location_match} "
-          f"checksum={result.content_checksum_ok})")
+          f"checksum={result.content_checksum_ok} "
+          f"vol_checksum={result.volume_content_checksum_ok})")
 
 if results_rows:
     writer.overwrite(results_rows)
     _OVERALL_PASS_IDX = VALIDATION_RESULTS_SCHEMA.fieldNames().index("overall_pass")
     pass_count = sum(1 for r in results_rows if r[_OVERALL_PASS_IDX])
+    _extra = []
+    if VALIDATE_CONTENT_CHECKSUM:
+        _extra.append("table checksum")
+    if VALIDATE_VOLUME_CONTENT_CHECKSUM:
+        _extra.append(f"volume checksum @ {VOLUME_CHECKSUM_SAMPLE_FRACTION:g}x")
     print(f"\n{pass_count} / {len(results_rows)} passed all evidence layers"
-          f"{' (incl. content checksum)' if VALIDATE_CONTENT_CHECKSUM else ''}.")
+          f"{(' (incl. ' + ', '.join(_extra) + ')') if _extra else ''}.")
 
 # COMMAND ----------
 # MAGIC %md
@@ -192,7 +277,8 @@ if results_rows:
 # COMMAND ----------
 spark.sql(
     f"SELECT catalog, schema, name, metadata_location_ok, delta_log_at_new_ok, "
-    f"       input_file_name_ok, parent_managed_location_match, evidence_json "
+    f"       input_file_name_ok, parent_managed_location_match, content_checksum_ok, "
+    f"       volume_content_checksum_ok, evidence_json "
     f"FROM {OPS_SCHEMA}.validation_results "
     f"WHERE NOT overall_pass"
 ).show(truncate=False)

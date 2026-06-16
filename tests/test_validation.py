@@ -202,6 +202,48 @@ def test_validate_volume_uses_information_schema_location():
     assert result.overall_pass is True
 
 
+def test_validate_volume_content_checksum_match_passes():
+    """Layer 6: matching per-file hashes for a managed volume pass and the
+    flag is set True (table checksum stays N/A)."""
+    spark = MagicMock()
+    fs = MagicMock()
+    spark.sql.side_effect = [
+        _result_mock([_row({"storage_location": "abfss://x@newacct.dfs.core.windows.net/v"})]),
+    ]
+    hashes = [("a/1.bin", "h1"), ("b/2.bin", "h2")]
+    result = validate_object_on_new(
+        spark=spark, fs=fs, catalog="c", schema="s", name="v",
+        expected_new_account="newacct",
+        parent_managed_location="abfss://x@newacct.dfs.core.windows.net/",
+        is_delta=False, is_external=False, object_type="VOLUME",
+        verify_volume_content_checksum=True,
+        volume_source_hashes=hashes, volume_target_hashes=list(reversed(hashes)),
+    )
+    assert result.volume_content_checksum_ok is True
+    assert result.content_checksum_ok is None       # table fingerprint N/A for volume
+    assert result.overall_pass is True
+
+
+def test_validate_volume_content_checksum_mismatch_blocks():
+    """Layer 6: a corrupt file (same path, different hash) fails overall_pass."""
+    spark = MagicMock()
+    fs = MagicMock()
+    spark.sql.side_effect = [
+        _result_mock([_row({"storage_location": "abfss://x@newacct.dfs.core.windows.net/v"})]),
+    ]
+    result = validate_object_on_new(
+        spark=spark, fs=fs, catalog="c", schema="s", name="v",
+        expected_new_account="newacct",
+        parent_managed_location="abfss://x@newacct.dfs.core.windows.net/",
+        is_delta=False, is_external=False, object_type="VOLUME",
+        verify_volume_content_checksum=True,
+        volume_source_hashes=[("a/1.bin", "h1")],
+        volume_target_hashes=[("a/1.bin", "CORRUPT")],
+    )
+    assert result.volume_content_checksum_ok is False
+    assert result.overall_pass is False
+
+
 def test_parse_input_file_name_rows():
     rows = [
         type("R", (), {"asDict": lambda self: {"path": "abfss://c@n.dfs.core.windows.net/x/p1"}})(),

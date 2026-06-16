@@ -157,10 +157,16 @@ def plan_external_volume_migration(
 # the pure SQL builders; the file copy + integrity verification live in the
 # notebook because they need dbutils.fs.
 
-def build_create_managed_volume_sql(catalog: str, schema: str, name: str) -> str:
+def build_create_managed_volume_sql(catalog: str, schema: str, name: str,
+                                    if_not_exists: bool = False) -> str:
     """A managed volume is created with no LOCATION; UC places it at the
-    schema's managed location (repointed to new storage by 00_repoint_schemas)."""
-    return f"CREATE VOLUME {quote_fqn(catalog, schema, name)}"
+    schema's managed location (repointed to new storage by 00_repoint_schemas).
+
+    Pass ``if_not_exists=True`` for the staging volume so a resumed run (after a
+    prior copy timed out) reuses the existing staging volume instead of failing
+    on a duplicate-name error."""
+    ine = "IF NOT EXISTS " if if_not_exists else ""
+    return f"CREATE VOLUME {ine}{quote_fqn(catalog, schema, name)}"
 
 
 def build_drop_volume_sql(catalog: str, schema: str, name: str) -> str:
@@ -198,6 +204,90 @@ def compare_volume_listings(old, new) -> tuple[bool, dict]:
         "old_file_count": len(old_map), "new_file_count": len(new_map),
         "old_total_bytes": sum(old_map.values()), "new_total_bytes": sum(new_map.values()),
         "missing": missing[:50], "extra": extra[:50], "size_mismatch": size_mismatch[:50],
+        "match": match,
+    }
+    return match, evidence
+
+
+def build_volume_copy_pairs(src_root, dst_root, src_listing):
+    """Expand a ``[(relpath, size)]`` source listing into copy work items.
+
+    Returns ``[(src_path, dst_path, relpath, size), ...]`` where each path is
+    ``<root>/<relpath>``. Roots are normalized (trailing slashes stripped) so a
+    root passed with or without a trailing ``/`` yields identical work items.
+    Used by 03b's managed-volume Step 6.5 to fan the copy out across threads
+    (or Spark partitions) instead of one sequential ``dbutils.fs.cp(recurse)``.
+    """
+    s = src_root.rstrip("/")
+    d = dst_root.rstrip("/")
+    return [(f"{s}/{rel}", f"{d}/{rel}", rel, sz) for rel, sz in src_listing]
+
+
+def plan_resumable_volume_copy(src_listing, dst_listing):
+    """Split a source listing into ``(to_copy, already_done)`` for a resumable copy.
+
+    Both inputs are ``[(relpath, size)]``. A source file counts as *already
+    done* only when the target already holds the same relpath AND an identical
+    size; otherwise it goes in ``to_copy`` (missing entirely, or a half-written
+    file whose size differs and must be re-copied). This is what lets a managed
+    volume migration that hit the job timeout mid-copy resume on re-run and
+    only move the remaining files, rather than restarting from zero. Order of
+    ``src_listing`` is preserved in both returned lists.
+    """
+    dst_map = {rel: sz for rel, sz in dst_listing}
+    to_copy, done = [], []
+    for rel, sz in src_listing:
+        if dst_map.get(rel) == sz:
+            done.append((rel, sz))
+        else:
+            to_copy.append((rel, sz))
+    return to_copy, done
+
+
+def select_checksum_sample(listing, fraction):
+    """Deterministically pick a fraction of files to content-hash.
+
+    ``listing`` is ``[(relpath, size)]``. Selection is by a STABLE hash of the
+    relpath (not position or RNG), so the source volume and the migrated volume
+    independently select the *same* set of files — their sampled fingerprints
+    are therefore comparable. ``fraction >= 1.0`` returns everything; ``<= 0``
+    returns nothing. A larger fraction is always a superset of a smaller one
+    (the threshold only moves outward), so widening the sample never drops a
+    previously-chosen file. Order of ``listing`` is preserved.
+    """
+    if fraction >= 1.0:
+        return list(listing)
+    if fraction <= 0.0:
+        return []
+    import hashlib
+    cutoff = fraction * 0xFFFFFFFF
+    out = []
+    for rel, sz in listing:
+        bucket = int(hashlib.md5(rel.encode("utf-8")).hexdigest()[:8], 16)
+        if bucket < cutoff:
+            out.append((rel, sz))
+    return out
+
+
+def compare_volume_content_hashes(source, target):
+    """Compare two ``[(relpath, content_hash)]`` listings for byte-level identity.
+
+    The content analogue of :func:`compare_volume_listings`: a match requires
+    the SAME set of relative paths AND an identical content hash per path. This
+    catches same-size-but-corrupt files that the count+size+path gate cannot.
+    ``source`` is typically the retained ``__pre_migration`` shadow volume;
+    ``target`` is the migrated volume. Returns ``(match, evidence)``.
+    """
+    s = {rel: h for rel, h in source}
+    t = {rel: h for rel, h in target}
+    sk, tk = set(s), set(t)
+    missing = sorted(sk - tk)          # in source, absent from target
+    extra = sorted(tk - sk)            # in target, not expected
+    hash_mismatch = sorted(p for p in (sk & tk) if s[p] != t[p])
+    match = not missing and not extra and not hash_mismatch
+    evidence = {
+        "source_file_count": len(s), "target_file_count": len(t),
+        "missing": missing[:50], "extra": extra[:50], "hash_mismatch": hash_mismatch[:50],
         "match": match,
     }
     return match, evidence

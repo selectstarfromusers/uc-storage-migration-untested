@@ -109,6 +109,10 @@ OLD_STORAGE_ACCOUNT = _cfg.OLD_STORAGE_ACCOUNT
 NEW_STORAGE_ACCOUNT = _cfg.NEW_STORAGE_ACCOUNT
 OPS_SCHEMA = _cfg.OPS_SCHEMA
 ALLOW_MANAGED_VOLUMES_SKIP = _cfg.ALLOW_MANAGED_VOLUMES_SKIP
+LARGE_VOLUME_FILE_THRESHOLD = _cfg.LARGE_VOLUME_FILE_THRESHOLD
+VOLUME_COPY_PARALLELISM = _cfg.VOLUME_COPY_PARALLELISM
+VOLUME_DISTRIBUTED_COPY = _cfg.VOLUME_DISTRIBUTED_COPY
+VOLUME_DISTRIBUTED_COPY_PARTITIONS = _cfg.VOLUME_DISTRIBUTED_COPY_PARTITIONS
 
 # Per-run operational gates — stay in this notebook so a single edit to
 # utils/config.py can't arm destructive ops across multiple notebooks.
@@ -130,8 +134,9 @@ from utils.migration import (
     plan_managed_delta_migration, plan_managed_non_delta_migration,
     plan_external_table_migration, plan_external_volume_migration,
     derive_pre_migration_fqn, derive_staging_fqn,
-    build_create_managed_volume_sql, build_drop_volume_sql,
+    build_create_managed_volume_sql,
     build_rename_volume_sql, compare_volume_listings,
+    build_volume_copy_pairs, plan_resumable_volume_copy,
 )
 from utils.preflight import (
     check_external_location_for, probe_path_exists, probe_partition_completeness,
@@ -498,6 +503,85 @@ def _walk_volume(base):
     return out
 
 
+def _copy_files_threaded(pairs, parallelism):
+    """Driver-side parallel copy of [(src, dst, rel, size), ...] via dbutils.fs.cp.
+
+    dbutils.fs.cp is I/O-bound (a per-file object-store PUT), so a bounded
+    thread pool turns the sequential recurse-copy into hundreds of concurrent
+    copies without needing executors — works on every compute type including
+    serverless. Each cp creates parent dirs implicitly. Returns the count
+    copied. Raises the first worker exception (so the volume is logged failed
+    and staging is kept for a resumable re-run)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(p):
+        src, dst, _rel, _sz = p
+        dbutils.fs.cp(src, dst)  # noqa: F821
+
+    n = 0
+    with ThreadPoolExecutor(max_workers=parallelism) as ex:
+        for _ in ex.map(_one, pairs):
+            n += 1
+    return n
+
+
+def _copy_files_distributed(pairs, partitions):
+    """Opt-in copy across Spark EXECUTORS via local `/Volumes` FUSE writes.
+
+    Faster on large all-purpose/dedicated clusters, but executor FUSE writes to
+    UC Volumes are not guaranteed on every compute type (e.g. serverless) —
+    gated behind VOLUME_DISTRIBUTED_COPY. Skips files already present at the
+    target with a matching size, so it is itself resumable."""
+    def _copy_part(rows):
+        import os, shutil
+        for src, dst, rel, sz in rows:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst) and os.path.getsize(dst) == sz:
+                continue
+            shutil.copyfile(src, dst)
+
+    (spark.createDataFrame(pairs, "src string, dst string, rel string, sz long")
+          .repartition(partitions)
+          .foreachPartition(_copy_part))
+
+
+def _migrate_one_managed_volume_copy(old_vol, new_vol, *, dry_run):
+    """Copy phase of the managed-volume staging swap: walk source once, plan a
+    resumable copy against whatever already landed in staging (from a prior
+    timed-out run), copy the remainder via the configured mechanism, then walk
+    the target once and verify count/size/paths. Returns (match, evidence).
+
+    The source is walked exactly once and the target once (plus a cheap
+    existing-staging walk that is empty on a first run) — no double walk of the
+    546k-file source. On a verify mismatch the caller keeps staging so a re-run
+    resumes; the original volume is never touched here."""
+    src_listing = _walk_volume(old_vol)
+    n_src = len(src_listing)
+    # On a dry run the staging volume does not exist yet, so don't walk it.
+    existing = [] if dry_run else _walk_volume(new_vol)  # partial on resume
+    to_copy, done = plan_resumable_volume_copy(src_listing, existing)
+    big = n_src >= LARGE_VOLUME_FILE_THRESHOLD
+    mode = ("distributed" if VOLUME_DISTRIBUTED_COPY else "threaded") if big else "simple-recurse"
+    print(f"    {n_src} source files ({sum(s for _, s in src_listing)} bytes); "
+          f"{len(done)} already staged, {len(to_copy)} to copy; mode={mode}")
+    if dry_run:
+        return None, {"dry_run": True, "src_file_count": n_src, "to_copy": len(to_copy), "mode": mode}
+
+    if to_copy:
+        pairs = build_volume_copy_pairs(old_vol, new_vol, to_copy)
+        if not big:
+            # Small volume: proven low-overhead path.
+            for src, dst, _rel, _sz in pairs:
+                dbutils.fs.cp(src, dst)  # noqa: F821
+        elif VOLUME_DISTRIBUTED_COPY:
+            _copy_files_distributed(pairs, VOLUME_DISTRIBUTED_COPY_PARTITIONS)
+        else:
+            _copy_files_threaded(pairs, VOLUME_COPY_PARALLELISM)
+
+    new_listing = _walk_volume(new_vol)
+    return compare_volume_listings(src_listing, new_listing)
+
+
 managed_volumes = [r for r in drift if r["object_type"] == "VOLUME" and r["table_type"] == "MANAGED"]
 if not managed_volumes:
     print("No managed volumes on old storage.")
@@ -514,27 +598,38 @@ else:
                                     name=rec.name, object_type="VOLUME")
             staging_c, staging_s, staging_n = derive_staging_fqn(rec.catalog, rec.schema, rec.name)
             pre_c, pre_s, pre_n = derive_pre_migration_fqn(rec.catalog, rec.schema, rec.name)
+            old_vol = f"/Volumes/{rec.catalog}/{rec.schema}/{rec.name}"
+            new_vol = f"/Volumes/{staging_c}/{staging_s}/{staging_n}"
             if DRY_RUN:
                 print(f"  [DRY RUN] would migrate managed volume {rec.catalog}.{rec.schema}.{rec.name} "
                       f"(create {staging_n} → copy → verify → swap → replay)")
+                # Preflight: surface the file count up front — a huge volume is
+                # exactly what blows the job timeout, so operators see it here.
+                _migrate_one_managed_volume_copy(old_vol, new_vol, dry_run=True)
                 mig_log.update(catalog=rec.catalog, schema=rec.schema, name=rec.name, status="claimed")
                 continue
 
             snap_writer.append(catalog=rec.catalog, schema=rec.schema, name=rec.name,
                                object_type="VOLUME", snapshot_json=_serialize_snapshot(snap))
             # 1. New managed volume (lands on the schema's new-storage location).
-            spark.sql(build_create_managed_volume_sql(staging_c, staging_s, staging_n))
-            # 2. Copy via the governed /Volumes/ paths — NOT the raw
-            # __unitystorage storage_location (UC denies direct dbutils.fs
-            # access to managed storage: LOCATION_OVERLAP).
-            old_vol = f"/Volumes/{rec.catalog}/{rec.schema}/{rec.name}"
-            new_vol = f"/Volumes/{staging_c}/{staging_s}/{staging_n}"
-            dbutils.fs.cp(old_vol, new_vol, recurse=True)  # noqa: F821
-            # 3. Verify file count/size/paths — BLOCK on mismatch.
-            match, ev = compare_volume_listings(_walk_volume(old_vol), _walk_volume(new_vol))
+            # Idempotent on a resumed run: a staging volume left by a prior
+            # timed-out attempt is reused (CREATE ... IF NOT EXISTS), and the
+            # copy below skips files already landed in it.
+            spark.sql(build_create_managed_volume_sql(staging_c, staging_s, staging_n,
+                                                      if_not_exists=True))
+            # 2+3. Copy via the governed /Volumes/ paths (NOT the raw
+            # __unitystorage location — UC denies direct dbutils.fs access:
+            # LOCATION_OVERLAP) and verify count/size/paths. The copy is
+            # parallel + resumable for large volumes; see
+            # _migrate_one_managed_volume_copy.
+            match, ev = _migrate_one_managed_volume_copy(old_vol, new_vol, dry_run=False)
             if not match:
-                spark.sql(build_drop_volume_sql(staging_c, staging_s, staging_n))
-                raise RuntimeError(f"managed-volume integrity mismatch (staging dropped, "
+                # Keep staging (do NOT drop) — the partial copy is the resume
+                # point; re-running this notebook copies only the remainder.
+                # The original is still untouched (no swap happened), so this
+                # is safe. 05_cleanup / a manual DROP VOLUME removes the
+                # staging volume if the migration is abandoned.
+                raise RuntimeError(f"managed-volume integrity mismatch (staging KEPT for resume, "
                                    f"original untouched): {ev}")
             # 4. Swap: keep original as __pre_migration, promote staging.
             spark.sql(build_rename_volume_sql(rec.catalog, rec.schema, rec.name, pre_n))

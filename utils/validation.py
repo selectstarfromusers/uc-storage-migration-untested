@@ -25,6 +25,7 @@ def _is_on_account(url: Optional[str], expected_account: str) -> bool:
     parsed = parse_storage_url(url)
     return parsed is not None and parsed.account == expected_account
 from utils.sql import quote_fqn, parse_describe_extended_location
+from utils.migration import compare_volume_content_hashes
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class ValidationResult:
     input_file_name_ok: Optional[bool]      # None if table was empty (no files to sample)
     parent_managed_location_match: Optional[bool]  # None if N/A (external object)
     content_checksum_ok: Optional[bool]            # None if N/A (disabled / external / no source)
+    volume_content_checksum_ok: Optional[bool]     # None if N/A (non-volume / disabled / no source)
     overall_pass: bool
     evidence: dict
     validated_at: datetime
@@ -151,6 +153,9 @@ def validate_object_on_new(
     object_type: str = "TABLE",
     verify_content_checksum: bool = False,
     compare_fqn: Optional[str] = None,
+    verify_volume_content_checksum: bool = False,
+    volume_source_hashes: Optional[list] = None,
+    volume_target_hashes: Optional[list] = None,
 ) -> ValidationResult:
     """Run the evidence layers against the migrated object and return a result.
 
@@ -272,14 +277,38 @@ def validate_object_on_new(
     else:
         content_checksum_ok = None
         if verify_content_checksum and is_vol:
-            evidence["content_checksum_skipped"] = "volume — file-level integrity is verified at migration time (03b Step 6.5)"
+            evidence["content_checksum_skipped"] = "volume — see volume_content_checksum (Layer 6); table fingerprint is N/A"
         elif verify_content_checksum and is_external:
             evidence["content_checksum_skipped"] = "external object — no __pre_migration source to compare"
         elif verify_content_checksum and not compare_fqn:
             evidence["content_checksum_skipped"] = "no compare_fqn provided"
 
+    # --- Layer 6: per-file content hash for managed VOLUMES vs the shadow ---
+    # The volume analogue of Layer 5. The expensive byte-reading + hashing is
+    # done by the caller (04_validation, via Spark binaryFile / chunked FUSE
+    # reads) and passed in as [(relpath, hash)] listings; this layer just
+    # compares them. Managed volumes only — external volumes are
+    # dropped+recreated with no retained shadow to diff.
+    volume_content_checksum_ok: Optional[bool]
+    if verify_volume_content_checksum and is_vol and not is_external \
+            and volume_source_hashes is not None and volume_target_hashes is not None:
+        try:
+            match, ev = compare_volume_content_hashes(volume_source_hashes, volume_target_hashes)
+            volume_content_checksum_ok = match
+            evidence["volume_content_checksum"] = ev
+        except Exception as e:
+            volume_content_checksum_ok = False
+            evidence["volume_content_checksum_error"] = str(e)
+    else:
+        volume_content_checksum_ok = None
+        if verify_volume_content_checksum and is_vol and is_external:
+            evidence["volume_content_checksum_skipped"] = "external volume — no __pre_migration shadow to compare"
+        elif verify_volume_content_checksum and is_vol:
+            evidence["volume_content_checksum_skipped"] = "no source/target hash listings provided"
+
     # overall_pass: every non-None layer must be True; None means N/A and is skipped.
-    layer_results = [metadata_ok, delta_log_ok, input_ok, parent_ok, content_checksum_ok]
+    layer_results = [metadata_ok, delta_log_ok, input_ok, parent_ok,
+                     content_checksum_ok, volume_content_checksum_ok]
     overall = all(lr is not False for lr in layer_results) and any(lr is True for lr in layer_results)
 
     return ValidationResult(
@@ -289,6 +318,7 @@ def validate_object_on_new(
         input_file_name_ok=input_ok,
         parent_managed_location_match=parent_ok,
         content_checksum_ok=content_checksum_ok,
+        volume_content_checksum_ok=volume_content_checksum_ok,
         overall_pass=overall,
         evidence=evidence,
         validated_at=datetime.now(timezone.utc).replace(tzinfo=None),
